@@ -3,7 +3,8 @@
 ## 模块
 
 - cmd/demo：显式启动两个虚构 MCP 下游并运行发现演示。
-- cmd/gateway：读取配置，只启动入口；不启动任何下游。
+- cmd/gateway：读取配置启动入口，或执行显式本地离线状态/撤权操作；不启动任何下游。
+- cmd/mock：显式启动一个固定合成下游，仅用于本地预览。
 - internal/gateway/config.go：受限 JSON 配置与连接/身份/策略校验。
 - internal/gateway/persistence.go：可选 SQLite 单实例存储、凭据加密、状态完整性与失败关闭。
 - internal/gateway/identity.go：合成身份、内存绑定与策略版本、受信进程内变更和本地撤权。
@@ -64,4 +65,4 @@ Refresh 按确定顺序执行，并原子替换整个目录。失败系统不保
 
 ## 可选持久化
 
-NewPersistent 为库级显式选择，默认命令仍使用 New 的内存模式。候选授权状态提交到 SQLite 后才发布；写失败关闭准入，重开不重新导入旧策略或凭据。入口只存验证摘要，下游凭据使用独立外部密钥派生的 AEAD 加密，元数据仍可读。单实例所有权、关闭、初始化和旧备份风险见 [存储说明](persistence.md)。
+NewPersistent 为显式选择；cmd/gateway 用 -db 和独立 key 输入启用，默认仍使用 New 的内存模式。候选授权状态提交到 SQLite 后才发布；写失败关闭准入，重开不重新导入旧策略或凭据。入口只存验证摘要，下游凭据使用独立外部密钥派生的 AEAD 加密，元数据仍可读。单实例所有权、关闭、初始化和旧备份风险见 [存储说明](persistence.md)。
