@@ -96,6 +96,8 @@ func validCredential(value string, auth AuthConfig) bool {
 }
 
 type User struct {
+	Tenant      string            `json:"tenant,omitempty"`
+	Principal   string            `json:"principal,omitempty"`
 	Token       string            `json:"token"`
 	Allowed     []string          `json:"allowed"`
 	Credentials map[string]string `json:"credentials"`

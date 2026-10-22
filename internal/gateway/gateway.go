@@ -26,20 +26,27 @@ const (
 )
 
 type entry struct {
-	system   System
-	original string
-	tool     *mcp.Tool
-	input    *boundedSchema
+	system        System
+	original      string
+	tool          *mcp.Tool
+	input         *boundedSchema
+	generation    uint64
+	policyVersion uint64
 }
 type snapshot struct {
 	catalogs map[string]map[string]entry
 	handlers map[string]http.Handler
 }
 type Gateway struct {
-	systems   map[string]System
-	users     map[string]User
-	refreshMu sync.Mutex
-	state     atomic.Pointer[snapshot]
+	mu            sync.Mutex
+	principals    map[string]*principalState
+	identities    map[Identity]string
+	operations    map[uint64]admittedOperation
+	nextOperation uint64
+	systems       map[string]System
+	users         map[string]User
+	refreshMu     sync.Mutex
+	state         atomic.Pointer[snapshot]
 }
 
 // DiscoveryIssue contains no credentials, raw downstream errors or tool descriptions.
@@ -75,7 +82,7 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, errors.New("invalid demo identity")
 		}
 		tokens[user.Token] = true
-		clone := User{Token: user.Token, Allowed: append([]string(nil), user.Allowed...), Credentials: map[string]string{}}
+		clone := User{Tenant: user.Tenant, Principal: user.Principal, Token: user.Token, Allowed: append([]string(nil), user.Allowed...), Credentials: map[string]string{}}
 		if len(clone.Allowed) > 2048 {
 			return nil, errors.New("too many policy tools")
 		}
@@ -92,26 +99,19 @@ func New(cfg Config) (*Gateway, error) {
 		}
 		g.users[id] = clone
 	}
+	if err := g.initializeIdentities(); err != nil {
+		return nil, err
+	}
 	g.state.Store(g.makeSnapshot(map[string]map[string]entry{}))
 	return g, nil
 }
 
-func (g *Gateway) allowed(id, name string) bool {
-	user, ok := g.users[id]
-	if !ok {
-		return false
-	}
-	for _, n := range user.Allowed {
-		if n == name {
-			return true
-		}
-	}
-	return false
-}
 func (g *Gateway) Names(id string) []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	names := []string{}
 	for name := range g.state.Load().catalogs[id] {
-		if g.allowed(id, name) {
+		if _, ok := g.evaluateLocked(id, name); ok {
 			names = append(names, name)
 		}
 	}
@@ -119,9 +119,8 @@ func (g *Gateway) Names(id string) []string {
 	return names
 }
 
-// Refresh performs separate authenticated discovery per user and system. Failed systems
-// contribute no tools, including on refresh; stale catalogs are never retained on failure.
-// Updates are atomic, with no public administration or automatic refresh endpoint.
+// Refresh captures authorization revisions per discovery and rechecks at atomic
+// publication. Network operations never hold the authorization lock.
 func (g *Gateway) Refresh(ctx context.Context) []DiscoveryIssue {
 	g.refreshMu.Lock()
 	defer g.refreshMu.Unlock()
@@ -140,30 +139,56 @@ func (g *Gateway) Refresh(ctx context.Context) []DiscoveryIssue {
 	for _, id := range ids {
 		catalogs[id] = map[string]entry{}
 		for _, name := range systems {
+			g.mu.Lock()
+			p := g.principals[id]
 			needed := false
-			for _, allowed := range g.users[id].Allowed {
-				if strings.HasPrefix(allowed, name+"__") {
-					needed = true
-					break
+			if !p.disabled {
+				for _, allowed := range p.allowed {
+					if strings.HasPrefix(allowed, name+"__") {
+						needed = true
+						break
+					}
 				}
 			}
 			if !needed {
+				g.mu.Unlock()
 				continue
 			}
-			token := g.users[id].Credentials[name]
-			if token == "" {
+			b := p.bindings[name]
+			if b.info.State != BindingActive || b.credential == "" {
+				g.mu.Unlock()
 				issues = append(issues, DiscoveryIssue{id, name, "credential unavailable"})
 				continue
 			}
-			entries, err := g.discover(ctx, g.systems[name], token)
+			generation, version, token := b.info.Generation, p.version, b.credential
+			opCtx, cancel := context.WithCancel(ctx)
+			g.nextOperation++
+			opID := g.nextOperation
+			g.operations[opID] = admittedOperation{id, name, cancel}
+			g.mu.Unlock()
+			entries, err := g.discover(opCtx, g.systems[name], token)
+			g.mu.Lock()
+			delete(g.operations, opID)
+			cancel()
 			if err != nil {
 				issues = append(issues, DiscoveryIssue{id, name, "discovery failed; system catalog unavailable"})
-				continue
-			}
-			for tool, e := range entries {
-				if g.allowed(id, tool) {
-					catalogs[id][tool] = e
+			} else {
+				for tool, e := range entries {
+					e.generation, e.policyVersion = generation, version
+					if g.entryAllowedLocked(id, tool, e) {
+						catalogs[id][tool] = e
+					}
 				}
+			}
+			g.mu.Unlock()
+		}
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for id, cat := range catalogs {
+		for name, e := range cat {
+			if !g.entryAllowedLocked(id, name, e) {
+				delete(cat, name)
 			}
 		}
 	}
@@ -284,7 +309,7 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (ma
 
 			original := copy.Name
 			copy.Name = name
-			entries[name] = entry{system, original, &copy, resolved}
+			entries[name] = entry{system: system, original: original, tool: &copy, input: resolved}
 		}
 		if result.NextCursor == "" {
 			if err := ctx.Err(); err != nil {
@@ -437,12 +462,10 @@ func validateSchemaTypes(value any) error {
 // Call authorizes independently of discovery and validates the discovered input schema.
 // Neither caller arguments nor downstream names can choose an endpoint or credential.
 func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.CallToolResult, error) {
-	e, exists := g.state.Load().catalogs[id][name]
-	if !exists || !g.allowed(id, name) {
-		return nil, ErrDenied
-	}
-	token := g.users[id].Credentials[e.system.Name]
-	if token == "" {
+	g.mu.Lock()
+	e, exists := g.evaluateLocked(id, name)
+	g.mu.Unlock()
+	if !exists {
 		return nil, ErrDenied
 	}
 	if err := ctx.Err(); err != nil {
@@ -470,6 +493,24 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.Cal
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	// Final dispatch admission and revocation share this lock. A request admitted
+	// first is in flight even if its first network byte is sent later.
+	g.mu.Lock()
+	current, ok := g.evaluateLocked(id, name)
+	if !ok || current.tool != e.tool || current.generation != e.generation || current.policyVersion != e.policyVersion {
+		g.mu.Unlock()
+		return nil, ErrDenied
+	}
+	if err := ctx.Err(); err != nil {
+		g.mu.Unlock()
+		return nil, err
+	}
+	token := g.principals[id].bindings[e.system.Name].credential
+	g.nextOperation++
+	opID := g.nextOperation
+	g.operations[opID] = admittedOperation{id, e.system.Name, cancel}
+	g.mu.Unlock()
+	defer func() { g.mu.Lock(); delete(g.operations, opID); g.mu.Unlock() }()
 	session, err := connect(ctx, e.system, token)
 	if err != nil {
 		return nil, errors.New("downstream unavailable")
@@ -487,21 +528,51 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.Cal
 func (g *Gateway) makeSnapshot(catalogs map[string]map[string]entry) *snapshot {
 	state := &snapshot{catalogs: catalogs, handlers: map[string]http.Handler{}}
 	for id := range g.users {
-		server := mcp.NewServer(&mcp.Implementation{Name: "mcp-entry", Version: "0.2.0-demo"}, nil)
-		for name, e := range catalogs[id] {
-			server.AddTool(e.tool, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-				result, err := g.Call(ctx, id, name, req.Params.Arguments)
-				if err != nil {
-					result = &mcp.CallToolResult{}
-					result.SetError(err)
-					return result, nil
-				}
-				return result, nil
-			})
-		}
-		state.handlers[id] = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, MaxRequestBodyBytes: 64 << 10})
+		state.handlers[id] = g.toolHandler(id, catalogs[id])
 	}
 	return state
+}
+
+func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler {
+	server := mcp.NewServer(&mcp.Implementation{Name: "mcp-entry", Version: "0.2.0-demo"}, nil)
+	for name, e := range catalog {
+		server.AddTool(e.tool, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			result, err := g.Call(ctx, id, name, req.Params.Arguments)
+			if err != nil {
+				result = &mcp.CallToolResult{}
+				result.SetError(err)
+			}
+			return result, nil
+		})
+	}
+	// Even a previously captured SDK handler rechecks list eligibility and its
+	// catalog revision. It can never expose an old binding's schema as a new one.
+	server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			result, err := next(ctx, method, req)
+			if err != nil || method != "tools/list" {
+				return result, err
+			}
+			list, ok := result.(*mcp.ListToolsResult)
+			if !ok {
+				return result, nil
+			}
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			filtered := make([]*mcp.Tool, 0, len(list.Tools))
+			for _, tool := range list.Tools {
+				e, exists := catalog[tool.Name]
+				current, allowed := g.evaluateLocked(id, tool.Name)
+				if exists && allowed && current.tool == e.tool && g.entryAllowedLocked(id, tool.Name, e) {
+					filtered = append(filtered, tool)
+				}
+			}
+			copy := *list
+			copy.Tools = filtered
+			return &copy, nil
+		}
+	})
+	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, MaxRequestBodyBytes: 64 << 10})
 }
 
 // Handler reauthenticates every request, never using session IDs as identities.
@@ -514,7 +585,14 @@ func (g *Gateway) Handler() http.Handler {
 		auth := r.Header.Get("Authorization")
 		for id, user := range g.users {
 			if auth == "Bearer "+user.Token {
-				g.state.Load().handlers[id].ServeHTTP(w, r)
+				g.mu.Lock()
+				active := !g.principals[id].disabled
+				handler := g.state.Load().handlers[id]
+				g.mu.Unlock()
+				if !active {
+					break
+				}
+				handler.ServeHTTP(w, r)
 				return
 			}
 		}
