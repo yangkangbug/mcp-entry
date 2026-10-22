@@ -14,14 +14,15 @@ import (
 type FailureCode string
 
 const (
-	FailureAuthentication FailureCode = "downstream_authentication_failed"
-	FailurePermission     FailureCode = "downstream_permission_denied"
-	FailureRateLimit      FailureCode = "downstream_rate_limited"
-	FailureService        FailureCode = "downstream_service_unavailable"
-	FailureTimeout        FailureCode = "downstream_timeout"
-	FailureCanceled       FailureCode = "downstream_canceled"
-	FailureTransport      FailureCode = "downstream_transport_failed"
-	FailureProtocol       FailureCode = "downstream_protocol_failed"
+	FailureAuthentication  FailureCode = "downstream_authentication_failed"
+	FailurePermission      FailureCode = "downstream_permission_denied"
+	FailureRateLimit       FailureCode = "downstream_rate_limited"
+	FailureService         FailureCode = "downstream_service_unavailable"
+	FailureTimeout         FailureCode = "downstream_timeout"
+	FailureCanceled        FailureCode = "downstream_canceled"
+	FailureTransport       FailureCode = "downstream_transport_failed"
+	FailureProtocol        FailureCode = "downstream_protocol_failed"
+	FailureSchemaAdmission FailureCode = "downstream_schema_rejected"
 )
 
 type FailurePhase string
@@ -39,16 +40,20 @@ const (
 // OutcomeUnknown is independent of category: even an HTTP rejection after a
 // tool dispatch is not evidence that the tool had no effects. Nothing retries.
 type DownstreamFailure struct {
-	Code           FailureCode  `json:"code"`
-	Phase          FailurePhase `json:"phase"`
-	HTTPStatus     int          `json:"http_status,omitempty"`
-	OutcomeUnknown bool         `json:"outcome_unknown"`
+	Code           FailureCode           `json:"code"`
+	Phase          FailurePhase          `json:"phase"`
+	HTTPStatus     int                   `json:"http_status,omitempty"`
+	OutcomeUnknown bool                  `json:"outcome_unknown"`
+	SchemaReason   SchemaAdmissionReason `json:"schema_reason,omitempty"`
 }
 
 func (f *DownstreamFailure) Error() string {
 	suffix := "; not retried"
 	if f.OutcomeUnknown {
 		suffix = "; outcome may be unknown; not retried"
+	}
+	if f.SchemaReason != "" {
+		return fmt.Sprintf("%s (%s; %s)%s", f.Code, f.Phase, f.SchemaReason, suffix)
 	}
 	return fmt.Sprintf("%s (%s)%s", f.Code, f.Phase, suffix)
 }
@@ -62,10 +67,11 @@ type failureEvidence struct {
 // Each operation owns an observation. Epochs prevent late reads from an old
 // phase from contaminating later phases. Only bounded safe evidence is stored.
 type failureObservation struct {
-	mu       sync.Mutex
-	phase    FailurePhase
-	epoch    uint64
-	evidence failureEvidence
+	mu           sync.Mutex
+	phase        FailurePhase
+	epoch        uint64
+	evidence     failureEvidence
+	schemaReason SchemaAdmissionReason
 }
 
 func withFailureObservation(ctx context.Context) (context.Context, *failureObservation) {
@@ -78,6 +84,7 @@ func (o *failureObservation) setPhase(phase FailurePhase) {
 	o.phase = phase
 	o.epoch++
 	o.evidence = failureEvidence{}
+	o.schemaReason = ""
 }
 func (o *failureObservation) record(epoch uint64, evidence failureEvidence) {
 	if evidence.code == "" {
@@ -89,6 +96,21 @@ func (o *failureObservation) record(epoch uint64, evidence failureEvidence) {
 		o.evidence = evidence
 	}
 }
+
+// The SDK may stringify middleware errors. Record safe local evidence
+// separately so HTTP/transport evidence always takes precedence.
+func observeSchemaAdmission(ctx context.Context, err error) error {
+	admission := schemaAdmissionFailure(err)
+	if o, ok := ctx.Value(failureObservationKey{}).(*failureObservation); ok {
+		o.mu.Lock()
+		if o.phase == FailureDiscovery {
+			o.schemaReason = admission.reason
+		}
+		o.mu.Unlock()
+	}
+	return admission
+}
+
 func statusFailure(status int) FailureCode {
 	switch {
 	case status == http.StatusUnauthorized:
@@ -135,9 +157,11 @@ func classifyDownstreamFailure(ctx context.Context, phase FailurePhase, err erro
 		return nil
 	}
 	f := &DownstreamFailure{Phase: phase, OutcomeUnknown: outcomeUnknown}
+	var schemaReason SchemaAdmissionReason
 	if o, ok := ctx.Value(failureObservationKey{}).(*failureObservation); ok {
 		o.mu.Lock()
 		if o.phase == phase {
+			schemaReason = o.schemaReason
 			f.Code, f.HTTPStatus = o.evidence.code, o.evidence.status
 		}
 		o.mu.Unlock()
@@ -149,6 +173,15 @@ func classifyDownstreamFailure(ctx context.Context, phase FailurePhase, err erro
 	// context is authoritative and does not require inspecting arbitrary text.
 	if f.Code == "" && ctx.Err() != nil {
 		f.Code = typedFailure(ctx.Err())
+	}
+	if f.Code == "" && phase == FailureDiscovery {
+		var admission *schemaAdmissionError
+		if errors.As(err, &admission) {
+			schemaReason = admission.reason
+		}
+		if schemaReason != "" {
+			f.Code, f.SchemaReason = FailureSchemaAdmission, schemaReason
+		}
 	}
 	if f.Code == "" {
 		f.Code = FailureProtocol
@@ -174,6 +207,7 @@ func (t failureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	// reads cannot replace evidence from the newer request.
 	t.observation.epoch++
 	t.observation.evidence = failureEvidence{}
+	t.observation.schemaReason = ""
 	epoch := t.observation.epoch
 	t.observation.mu.Unlock()
 	response, err := t.base.RoundTrip(r)

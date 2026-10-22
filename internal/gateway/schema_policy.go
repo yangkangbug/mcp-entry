@@ -5,11 +5,34 @@ import (
 	"errors"
 	"net/url"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
 )
+
+// SchemaAdmissionReason contains only local, bounded diagnostic evidence. It
+// never contains a tool name, schema path, expression, or validator error text.
+type SchemaAdmissionReason string
+
+const (
+	SchemaInvalidOrUnsupported       SchemaAdmissionReason = "invalid_or_unsupported"
+	SchemaRegexpInvalidOrUnsupported SchemaAdmissionReason = "regexp_invalid_or_unsupported"
+)
+
+type schemaAdmissionError struct{ reason SchemaAdmissionReason }
+
+func (e *schemaAdmissionError) Error() string {
+	return "schema admission rejected: " + string(e.reason)
+}
+func schemaAdmissionFailure(err error) *schemaAdmissionError {
+	var admission *schemaAdmissionError
+	if errors.As(err, &admission) {
+		return admission
+	}
+	return &schemaAdmissionError{reason: SchemaInvalidOrUnsupported}
+}
 
 // These limits are conservative admission budgets, not execution-time guarantees.
 // JSON nodes include containers and scalar values; the root has depth zero.
@@ -123,6 +146,15 @@ func (g *schemaPolicyGraph) add(value any, path string) (*schemaPolicyNode, erro
 	if err := rejectSchemaKeywordAliases(schema); err != nil {
 		return nil, err
 	}
+	if pattern, exists := schema["pattern"]; exists {
+		expression, ok := pattern.(string)
+		if !ok {
+			return nil, &schemaAdmissionError{reason: SchemaRegexpInvalidOrUnsupported}
+		}
+		if _, err := regexp.Compile(expression); err != nil {
+			return nil, &schemaAdmissionError{reason: SchemaRegexpInvalidOrUnsupported}
+		}
+	}
 	for _, key := range []string{"$dynamicRef", "x-mcp-header"} {
 		if _, exists := schema[key]; exists {
 			return nil, errors.New("dynamic schema references and header mappings unsupported")
@@ -165,6 +197,11 @@ func (g *schemaPolicyGraph) add(value any, path string) (*schemaPolicyNode, erro
 				return nil, errors.New("schema map keyword must contain an object")
 			}
 			for name, value := range children {
+				if key == "patternProperties" {
+					if _, err := regexp.Compile(name); err != nil {
+						return nil, &schemaAdmissionError{reason: SchemaRegexpInvalidOrUnsupported}
+					}
+				}
 				if key == "dependencies" {
 					if names, ok := value.([]any); ok && names != nil {
 						for _, name := range names {

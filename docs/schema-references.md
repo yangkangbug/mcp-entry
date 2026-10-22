@@ -44,3 +44,11 @@
 这些限制是保守的资源准入，不是精确的 CPU 计费或硬性墙钟中断。验证器的同步 Validate 没有取消 API；正则、枚举比较和 uniqueItems 等还有额外成本。不会启动超时后台 goroutine 后假装验证已停止，也不声称这些限制构成完整恶意 schema CPU 隔离。现有无引用 schema 同样受准入限制。
 
 发现时先检查目录规模和 schema，再交给 SDK 处理。一个系统任意工具不合格时，整个系统目录拒绝发布，旧目录也被清除；其他健康系统保持可用。调用参数不符合 schema 或资源准入时，不联系下游。下游输出 schema 也接受发现准入，但网关仍不独立验证实际输出内容。
+
+## 正则语法与安全诊断
+
+输入/输出 schema 的 `pattern` 值及 `patternProperties` 的键在真实 schema 位置接受 Go `regexp` 编译准入。使用的是 Go/RE2 语法子集，不是完整 ECMA-262：lookaround（前瞻/后顾）、反向引用、超过 1000 的计数重复等不受支持。现有合法正则的约束保留并执行，不会为了发布目录删除约束。examples、default、const、enum 或未知扩展中的普通数据不会被当作 schema 正则。
+
+发现阶段以固定 `downstream_schema_rejected` 和 `schema_reason` 提供本地诊断：一般准入拒绝为 `invalid_or_unsupported`，无效或不支持的正则为 `regexp_invalid_or_unsupported`。不解析原始错误字符串，不公开工具名、schema/属性路径、表达式或验证器错误文本。HTTP/传输证据优先于 schema 诊断；该分类不改变认证语义，不触发重试。
+
+这只是诊断改进，不是正则兼容性修复或按授权工具隔离目录。任何工具（包括白名单外工具）被拒绝时，该绑定的整个目录仍不可用，旧目录仍清除。审计只记录固定 `schema_rejected` 结果类别，不记录 schema 明细。该新枚举使用现有审计存储格式；旧版本二进制可能不识别包含该枚举的记录，不应把无需格式迁移理解为支持降级读取。

@@ -62,6 +62,7 @@ const (
 	AuditResultCanceled         AuditResult = "canceled"
 	AuditResultTransport        AuditResult = "transport"
 	AuditResultProtocol         AuditResult = "protocol"
+	AuditResultSchemaRejected   AuditResult = "schema_rejected"
 	AuditResultUnknown          AuditResult = "unknown"
 	AuditResultStorage          AuditResult = "storage"
 )
@@ -154,7 +155,7 @@ func ValidateAuditEvent(e AuditEvent) error {
 		return ErrAuditInvalid
 	}
 	switch e.Result {
-	case AuditResultPending, AuditResultSuccess, AuditResultDenied, AuditResultConflict, AuditResultAuthentication, AuditResultPermission, AuditResultRateLimit, AuditResultService, AuditResultTimeout, AuditResultCanceled, AuditResultTransport, AuditResultProtocol, AuditResultUnknown, AuditResultStorage:
+	case AuditResultPending, AuditResultSuccess, AuditResultDenied, AuditResultConflict, AuditResultAuthentication, AuditResultPermission, AuditResultRateLimit, AuditResultService, AuditResultTimeout, AuditResultCanceled, AuditResultTransport, AuditResultProtocol, AuditResultSchemaRejected, AuditResultUnknown, AuditResultStorage:
 	default:
 		return ErrAuditInvalid
 	}

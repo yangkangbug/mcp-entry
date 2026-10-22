@@ -133,6 +133,8 @@ func auditOutcome(err error) AuditResult {
 			return AuditResultTimeout
 		case FailureCanceled:
 			return AuditResultCanceled
+		case FailureSchemaAdmission:
+			return AuditResultSchemaRejected
 		case FailureProtocol:
 			return AuditResultProtocol
 		default:

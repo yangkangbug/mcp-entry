@@ -246,10 +246,10 @@ func connect(ctx context.Context, system System, token string) (*mcp.ClientSessi
 					}
 					for _, schema := range schemas {
 						if _, err := analyzeSchema(schema); err != nil {
-							return nil, err
+							return nil, observeSchemaAdmission(ctx, err)
 						}
 						if err := validateSchemaTypes(schema); err != nil {
-							return nil, err
+							return nil, observeSchemaAdmission(ctx, err)
 						}
 					}
 				}
@@ -365,7 +365,12 @@ func (s *boundedSchema) Validate(value any) error {
 	return s.resolved.Validate(value)
 }
 
-func resolveSchema(value any, input bool) (*boundedSchema, error) {
+func resolveSchema(value any, input bool) (result *boundedSchema, retErr error) {
+	defer func() {
+		if retErr != nil {
+			retErr = schemaAdmissionFailure(retErr)
+		}
+	}()
 	work, err := analyzeSchema(value)
 	if err != nil {
 		return nil, err
