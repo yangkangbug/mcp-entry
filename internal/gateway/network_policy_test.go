@@ -332,3 +332,129 @@ func TestNetworkDNSInternalDeadlineClassification(t *testing.T) {
 		t.Fatal("internal DNS budget lost timeout evidence", err)
 	}
 }
+
+func TestNetworkPlainHTTPExplicitOptIn(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.Write([]byte("ok")) }))
+	defer srv.Close()
+	endpoint := srv.URL + "/mcp"
+	policy := &NetworkPolicy{AllowedIPs: []string{"127.0.0.1"}, AllowInsecureHTTP: true}
+	rt, err := compileNetworkPolicy(endpoint, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.AllowInsecureHTTP = false
+	client := &http.Client{Transport: rt, Timeout: time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if calls.Load() != 1 {
+		t.Fatal("plaintext fixture not reached")
+	}
+	for _, bad := range []*NetworkPolicy{
+		{AllowedIPs: []string{"127.0.0.1"}},
+		{AllowInsecureHTTP: true},
+		{AllowedIPs: []string{"127.0.0.2"}, AllowInsecureHTTP: true},
+		{AllowedIPs: []string{"127.0.0.1"}, AllowInsecureHTTP: true, TrustedCAPEM: "misleading CA"},
+	} {
+		if _, err := compileNetworkPolicy(endpoint, bad); err == nil {
+			t.Fatal("accepted invalid plaintext policy")
+		}
+	}
+	if _, err := compileNetworkPolicy("http://10.0.0.1/mcp", nil); err == nil {
+		t.Fatal("remote plaintext default expanded")
+	}
+	if _, err := compileNetworkPolicy("http://10.0.0.1/mcp", &NetworkPolicy{AllowedIPs: []string{"10.0.0.1"}, AllowInsecureHTTP: true}); err != nil {
+		t.Fatal("explicit private HTTP rejected", err)
+	}
+	for _, ip := range []string{"169.254.169.254", "fd00:ec2::254"} {
+		if _, err := compileNetworkPolicy("http://service.test/mcp", &NetworkPolicy{AllowedIPs: []string{ip}, AllowInsecureHTTP: true}); err == nil {
+			t.Fatal("HTTP opt-in bypassed metadata deny")
+		}
+	}
+}
+
+func TestNetworkPlainHTTPDNSGuards(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		ips       []string
+		wantDials int
+	}{
+		{"allowed", []string{"10.0.0.1"}, 1},
+		{"mixed", []string{"10.0.0.1", "10.0.0.2"}, 0},
+		{"metadata", []string{"169.254.169.254"}, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dials := 0
+			rt, err := compileNetworkPolicyWith("http://service.test/mcp", &NetworkPolicy{AllowedIPs: []string{"10.0.0.1"}, AllowInsecureHTTP: true}, networkDependencies{
+				lookup: func(context.Context, string) ([]netip.Addr, error) {
+					var ips []netip.Addr
+					for _, raw := range tt.ips {
+						ips = append(ips, netip.MustParseAddr(raw))
+					}
+					return ips, nil
+				},
+				dial: func(_ context.Context, network, addr string) (net.Conn, error) {
+					dials++
+					if network != "tcp" || addr != "10.0.0.1:80" {
+						t.Fatalf("wrong HTTP target %s %s", network, addr)
+					}
+					return nil, errors.New("synthetic dial only")
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, _ := http.NewRequest("POST", "http://service.test/mcp", nil)
+			rt.RoundTrip(r)
+			if dials != tt.wantDials {
+				t.Fatalf("dials=%d", dials)
+			}
+			for _, endpoint := range []string{"http://other.test/mcp", "http://service.test/other", "http://service.test:8080/mcp"} {
+				r, _ := http.NewRequest("POST", endpoint, nil)
+				rt.RoundTrip(r)
+			}
+			if dials != tt.wantDials {
+				t.Fatal("HTTP request escaped fixed endpoint")
+			}
+		})
+	}
+}
+
+func TestNetworkPlainHTTPFlagDoesNotDisableTLS(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls.Add(1) }))
+	defer srv.Close()
+	rt, err := compileNetworkPolicy(srv.URL+"/mcp", &NetworkPolicy{AllowedIPs: []string{"127.0.0.1"}, AllowInsecureHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&http.Client{Transport: rt, Timeout: time.Second}).Get(srv.URL + "/mcp"); err == nil {
+		t.Fatal("HTTP flag disabled HTTPS certificate verification")
+	}
+	if calls.Load() != 0 {
+		t.Fatal("untrusted HTTPS reached HTTP handler")
+	}
+}
+
+func TestNetworkPlainHTTPOptInRedirectDenied(t *testing.T) {
+	var targets atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { targets.Add(1) }))
+	defer target.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+	rt, err := compileNetworkPolicy(srv.URL+"/mcp", &NetworkPolicy{AllowedIPs: []string{"127.0.0.1"}, AllowInsecureHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&http.Client{Transport: rt, Timeout: time.Second}).Get(srv.URL + "/mcp"); err == nil {
+		t.Fatal("HTTP redirect accepted")
+	}
+	if targets.Load() != 0 {
+		t.Fatal("HTTP redirect reached target")
+	}
+}

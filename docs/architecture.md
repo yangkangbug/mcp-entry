@@ -40,7 +40,7 @@ Refresh 按确定顺序执行，按用户和系统原子替换目录。失败系
 - 单系统发现 5 秒；命令启动发现总共 30 秒；工具调用上下文 10 秒，HTTP 客户端 12 秒。每个连接的 HTTP 请求、响应读取及有状态 session DELETE 清理都受同一个操作上下文约束，更早的调用方截止时间或取消同样生效。
 - schema 原始深度最多 32；仅支持验证器支持的 JSON Schema draft-07/2020-12；输入根必须显式为 object。仅接受有界、无环的同文档 JSON Pointer 引用；拒绝外部、动态及递归引用，不下载外部 schema。详见 [引用准入与限制](schema-references.md)。同步 schema 验证受节点/深度/工作量准入约束，不是可由操作 deadline 强制中断的 CPU 隔离。
 - 暂不支持 schema 位置的 x-mcp-header 参数映射，发现时直接拒绝；普通属性名及 example/default 数据中的同名键不是映射，允许保留。此限制避免不可信 schema 改变传输行为。复杂扩展兼容性不是本阶段目标。
-- 默认只接受字面回环 HTTP 下游；显式 network 策略允许验证证书与 IP 白名单的 HTTPS，详见 [网络边界](network-policy.md)。入口仅绑定回环，/mcp 拒绝 Origin；可选 /account 独立执行固定 Host/Origin 校验。
+- 默认只接受字面回环 HTTP 下游；显式 network 策略允许验证证书与 IP 白名单的 HTTPS，详见 [网络边界](network-policy.md)。入口默认仅绑定回环，显式远程测试模式支持 TLS 或另行许可的明文 HTTP，/mcp 拒绝 Origin；可选 /account 独立执行固定 Host/Origin 校验。
 - SDK 重连及自动 MultiRoundTrip 均关闭，无应用层工具重试。SDK 的 server/discover 到旧版 initialize 回退属于协议初始化，不是重复 tools/call。
 - session 清理同步执行，不另起后台任务，也不重试工具。若已收到明确工具结果，之后的 DELETE 超时或取消不会把成功改写成未知结果；尚未收到明确结果的中断仍按未知结果处理。
 - 发现只有完整获取并校验的系统目录才可发布；若仅在后续清理阶段超时，保留完整目录。列表获取/校验阶段中断则不发布该系统。远端拒绝或未确认 DELETE 时，不保证远端 session 已删除；保证本地请求可取消并释放资源。

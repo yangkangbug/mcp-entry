@@ -176,3 +176,19 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 }
 
 func validExpiryDate(t time.Time) bool { return t.IsZero() || (t.Year() >= 1 && t.Year() <= 9999) }
+
+// ValidateTestEntryAuth checks format and finite expiry, not entropy or production
+// readiness. At least one currently usable configured identity must remain.
+func (g *Gateway) ValidateTestEntryAuth() error {
+	if err := g.validateAccountAuth(); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for id := range g.users {
+		if g.principalUsableLocked(id) {
+			return nil
+		}
+	}
+	return errors.New("remote test requires an unexpired active entry identity")
+}

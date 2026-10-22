@@ -103,3 +103,5 @@ mcp-inspector --cli --config configs/private/client.json --server gateway \
 ## 可选本人绑定页面
 
 `-account` 默认关闭，仅用于 serve；即使显式传入 false，也不能与离线操作组合。它要求预配置的 32 字节 base64url 格式入口 token 与有限有效期，原 demo-alice/demo-bob 不满足要求。准备合成配置、绑定替换、定向刷新和重启验证见 [本人绑定预览](account-preview.md)。页面 Origin 自动取实际回环监听地址，没有任意 Origin 开关。
+
+远程客户端及非回环 HTTP/HTTPS 下游需使用独立显式开关，步骤和明文风险见 [远程 MCP 测试](remote-testing.md)。默认演示不放宽监听范围，cmd/mock 仍只接受回环地址。

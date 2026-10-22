@@ -4,7 +4,7 @@ A nonproduction Go MCP gateway: config-driven downstream discovery, per-user too
 
 ## 当前架构
 
-当前是单个 Go 网关进程，使用官方 MCP SDK 与 Streamable HTTP。下图只展示已实现部分；入口仍限回环 HTTP，默认下游也限回环 HTTP；可显式配置验证证书与 IP 允许列表的 HTTPS 下游。配置只使用虚构测试身份与凭证。已实现可选持久化、合成身份本地撤权及显式开启的本人绑定页面；OAuth、真实账号接入与生产密钥管理尚未实现。
+当前是单个 Go 网关进程，使用官方 MCP SDK 与 Streamable HTTP。下图只展示已实现部分；入口与下游默认限回环 HTTP；可显式配置受控 HTTPS 下游，另有独立的 [远程合成测试开关](docs/remote-testing.md) 支持远程 MCP HTTP/HTTPS。配置只使用虚构测试身份与凭证。已实现可选持久化、合成身份本地撤权及显式开启的本人绑定页面；OAuth、真实账号接入与生产密钥管理尚未实现。
 
 ```mermaid
 flowchart TB
@@ -144,7 +144,7 @@ CI 使用 go.mod 的 Go 版本执行格式、模块验证、测试、race、vet 
 
 产品范围、里程碑与反馈处理原则见 [路线图](docs/roadmap.md)。
 
-固定明文 token 只是演示身份，不是可信生产认证。入口仅允许回环 HTTP；/mcp 拒绝浏览器 Origin，显式开启的 /account 只接受固定同源访问。下游可按允许列表启用 HTTPS。拒绝重定向、外部/动态 schema 引用及递归引用，不适用于部署公网服务。工具描述、注解与返回内容仍是不可信外部数据；不提供提示注入净化保证。
+固定明文 token 只是演示身份，不是可信生产认证。入口默认仅允许回环 HTTP；远程合成测试必须显式开启并满足入口凭据要求，明文另需危险许可开关。/mcp 拒绝浏览器 Origin，显式开启的 /account 只接受固定同源访问。下游可按允许列表启用 HTTPS，或显式允许仅供合成测试的 HTTP。拒绝重定向、外部/动态 schema 引用及递归引用，不适用于部署公网服务。工具描述、注解与返回内容仍是不可信外部数据；不提供提示注入净化保证。
 
 尚未完成：OAuth/OIDC、真实账号网页绑定、生产凭证库与密钥轮换/备份恢复、管理界面、真实系统集成、多副本撤权、审计和限流、公网入口 TLS 与密钥轮换。不代理 resources、prompts、sampling、任务扩展或任意远程 MCP 地址。已支持[有界的同文档 schema 引用](docs/schema-references.md)，后续持续完善兼容性回归，并单独设计真实认证和生产凭证生命周期；当前不启用真实写操作。
 

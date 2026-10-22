@@ -1,6 +1,6 @@
 # 身份、账号绑定与撤权设计提案
 
-状态：总体设计提案；合成身份下的 [内存绑定与本地撤权内核](identity-kernel.md) 已实现，另有可选 [SQLite 持久化原型](persistence.md)；已新增可选本地本人绑定页面；真实身份、OAuth 网页授权、生产密钥管理和运维能力尚未实现。当前仍是回环入口、合成凭据的本地原型。本页供 [账号与认证 #5](https://github.com/yangkangbug/mcp-entry/issues/5)、[动态授权与运维 #6](https://github.com/yangkangbug/mcp-entry/issues/6) 评审，不构成生产安全或交付日期承诺。
+状态：总体设计提案；合成身份下的 [内存绑定与本地撤权内核](identity-kernel.md) 已实现，另有可选 [SQLite 持久化原型](persistence.md)；已新增可选本地本人绑定页面；真实身份、OAuth 网页授权、生产密钥管理和运维能力尚未实现。当前默认回环入口，可显式启用远程合成测试；仍不是生产身份平台。本页供 [账号与认证 #5](https://github.com/yangkangbug/mcp-entry/issues/5)、[动态授权与运维 #6](https://github.com/yangkangbug/mcp-entry/issues/6) 评审，不构成生产安全或交付日期承诺。
 
 ## 产品目标与明确边界
 

@@ -14,13 +14,16 @@ import (
 	"time"
 )
 
-// NetworkPolicy opts one fixed system endpoint into HTTPS. Every resolved address
+// NetworkPolicy opts one fixed system endpoint into controlled networking. Every resolved address
 // must appear literally in AllowedIPs, including private and loopback addresses.
 // TrustedCAPEM replaces system roots when supplied; it never disables verification.
+// AllowInsecureHTTP explicitly permits plaintext test endpoints; credentials and
+// data are then unencrypted. It never weakens verification for HTTPS endpoints.
 // This is administrator configuration, never a tool argument or a general proxy.
 type NetworkPolicy struct {
-	AllowedIPs   []string `json:"allowed_ips"`
-	TrustedCAPEM string   `json:"trusted_ca_pem,omitempty"`
+	AllowedIPs        []string `json:"allowed_ips"`
+	TrustedCAPEM      string   `json:"trusted_ca_pem,omitempty"`
+	AllowInsecureHTTP bool     `json:"allow_insecure_http,omitempty"`
 }
 
 type networkDependencies struct {
@@ -140,7 +143,13 @@ func compileNetworkPolicyWith(endpoint string, policy *NetworkPolicy, deps netwo
 		}
 		allowed[ip] = true
 	} else {
-		if u.Scheme != "https" || len(policy.AllowedIPs) == 0 || len(policy.AllowedIPs) > 64 || len(policy.TrustedCAPEM) > 128<<10 {
+		if u.Scheme == "http" && !policy.AllowInsecureHTTP {
+			return nil, errors.New("plaintext downstream requires allow_insecure_http")
+		}
+		if u.Scheme == "http" && policy.TrustedCAPEM != "" {
+			return nil, errors.New("trusted_ca_pem cannot secure a plaintext downstream")
+		}
+		if len(policy.AllowedIPs) == 0 || len(policy.AllowedIPs) > 64 || len(policy.TrustedCAPEM) > 128<<10 {
 			return nil, errNetworkPolicy
 		}
 		for _, raw := range policy.AllowedIPs {
