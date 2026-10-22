@@ -35,6 +35,7 @@ type PersistenceOptions struct {
 	Path       string
 	Key        []byte
 	Initialize bool
+	Migrate    bool
 }
 
 type storedBinding struct {
@@ -46,6 +47,9 @@ type storedBinding struct {
 	Credential []byte
 }
 type storedPrincipal struct {
+	EntryGeneration           uint64
+	EntryRevoked              bool
+	EntryStrong               bool
 	UserID, Tenant, Principal string
 	TokenHash                 []byte
 	TokenExpiresAt            time.Time
@@ -55,12 +59,21 @@ type storedPrincipal struct {
 	Bindings                  []storedBinding
 }
 type sqliteStore struct {
-	db       *sql.DB
-	conn     *sql.Conn
-	aead     cipher.AEAD
-	macKey   []byte
-	topology []byte
-	records  map[string]storedPrincipal
+	auditBaseSequence uint64
+	auditBaseHead     string
+	auditArchiveHash  string
+	version           int
+	allowLegacy       bool
+	auditKey          []byte
+	auditSequence     uint64
+	auditHead         string
+	auditIDCipher     []byte
+	db                *sql.DB
+	conn              *sql.Conn
+	aead              cipher.AEAD
+	macKey            []byte
+	topology          []byte
+	records           map[string]storedPrincipal
 }
 
 func entryTokenDigest(token string) [32]byte {
@@ -71,12 +84,24 @@ func derivedKey(key []byte, purpose string) ([]byte, error) {
 }
 
 // NewPersistent keeps catalogs transient. Reopening never reimports policies or
-// credentials, and rejects topology/token changes instead of merging config.
+// credentials, and rejects topology changes instead of merging config.
 func NewPersistent(cfg Config, opts PersistenceOptions) (*Gateway, error) {
+	if opts.Migrate {
+		return nil, ErrStorageVersion
+	}
+	return newPersistent(cfg, opts, false)
+}
+func OpenMaintenance(cfg Config, opts PersistenceOptions) (*Gateway, error) {
+	if opts.Initialize {
+		return nil, ErrStorage
+	}
+	return newPersistent(cfg, opts, true)
+}
+func newPersistent(cfg Config, opts PersistenceOptions, maintenance bool) (*Gateway, error) {
 	if len(opts.Key) != 32 || opts.Path == "" {
 		return nil, ErrStorage
 	}
-	g, err := New(cfg)
+	g, err := newGateway(cfg, opts.Initialize)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +119,7 @@ func NewPersistent(cfg Config, opts PersistenceOptions) (*Gateway, error) {
 		}
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 64<<20 {
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 128<<20 {
 		return nil, ErrStorage
 	}
 	// SQLite itself owns inter-process locking. An exclusive connection retains
@@ -140,7 +165,12 @@ func NewPersistent(cfg Config, opts PersistenceOptions) (*Gateway, error) {
 		Identities map[string]Identity
 	}{g.systems, identities})
 	topology := sha256.Sum256(topologyJSON)
-	store := &sqliteStore{db: db, aead: aead, macKey: macKey, topology: topology[:], records: map[string]storedPrincipal{}}
+	store := &sqliteStore{version: 4, allowLegacy: maintenance && opts.Migrate, db: db, aead: aead, macKey: macKey, topology: topology[:], records: map[string]storedPrincipal{}}
+	auditKey, err := derivedKey(opts.Key, "audit-chain")
+	if err != nil {
+		return nil, ErrStorage
+	}
+	store.auditKey = auditKey
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	conn, err := db.Conn(ctx)
@@ -176,13 +206,20 @@ func NewPersistent(cfg Config, opts PersistenceOptions) (*Gateway, error) {
 		return nil, ErrStorage
 	}
 	g.store = store
+	g.maintenance = maintenance
+	if store.version != 4 {
+		if err = g.migrateStorage(ctx); err != nil {
+			return nil, ErrStorage
+		}
+	}
 	success = true
 	return g, nil
 }
 
 const persistentSchema = `
-CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,topology BLOB NOT NULL,key_check BLOB NOT NULL,state_mac BLOB NOT NULL);
-CREATE TABLE principals(user_id TEXT PRIMARY KEY,tenant TEXT NOT NULL,principal TEXT NOT NULL,token_hash BLOB NOT NULL,token_expires_at TEXT NOT NULL,policy_version INTEGER NOT NULL,disabled INTEGER NOT NULL,allowed TEXT NOT NULL,UNIQUE(tenant,principal));
+CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,topology BLOB NOT NULL,key_check BLOB NOT NULL,state_mac BLOB NOT NULL,audit_sequence INTEGER NOT NULL,audit_head TEXT NOT NULL,audit_id_key BLOB NOT NULL,audit_base_sequence INTEGER NOT NULL,audit_base_head TEXT NOT NULL,audit_archive_hash TEXT NOT NULL);
+CREATE TABLE audit(sequence INTEGER PRIMARY KEY,event TEXT NOT NULL,mac TEXT NOT NULL);
+CREATE TABLE principals(user_id TEXT PRIMARY KEY,tenant TEXT NOT NULL,principal TEXT NOT NULL,token_hash BLOB NOT NULL,token_expires_at TEXT NOT NULL,policy_version INTEGER NOT NULL,disabled INTEGER NOT NULL,allowed TEXT NOT NULL,entry_generation INTEGER NOT NULL,entry_revoked INTEGER NOT NULL,entry_strong INTEGER NOT NULL,UNIQUE(tenant,principal));
 CREATE TABLE bindings(user_id TEXT NOT NULL REFERENCES principals(user_id),system TEXT NOT NULL,binding_id TEXT NOT NULL UNIQUE,generation INTEGER NOT NULL,state TEXT NOT NULL,expires_at TEXT NOT NULL,credential BLOB NOT NULL,PRIMARY KEY(user_id,system));`
 
 func bindingAAD(id string, p *principalState, b *bindingRecord) []byte {
@@ -197,7 +234,7 @@ func (s *sqliteStore) record(g *Gateway, id string, p *principalState) (storedPr
 		return storedPrincipal{}, ErrStorage
 	}
 	token := g.entryTokens[id]
-	r := storedPrincipal{UserID: id, Tenant: p.identity.Tenant, Principal: p.identity.Principal, TokenHash: append([]byte(nil), token[:]...), TokenExpiresAt: g.users[id].TokenExpiresAt, Version: p.version, Disabled: p.disabled, Allowed: append([]string(nil), p.allowed...)}
+	r := storedPrincipal{EntryGeneration: p.entry.Generation, EntryRevoked: p.entry.Revoked, EntryStrong: g.entryStrong[id], UserID: id, Tenant: p.identity.Tenant, Principal: p.identity.Principal, TokenHash: append([]byte(nil), token[:]...), TokenExpiresAt: g.users[id].TokenExpiresAt, Version: p.version, Disabled: p.disabled, Allowed: append([]string(nil), p.allowed...)}
 	for _, name := range sortedBindingNames(p.bindings) {
 		b := p.bindings[name]
 		if b.info.Generation == 0 || b.info.Generation > math.MaxInt64 {
@@ -216,6 +253,9 @@ func sortedBindingNames(bindings map[string]*bindingRecord) []string {
 	return names
 }
 func (s *sqliteStore) stateMAC(records map[string]storedPrincipal) []byte {
+	return s.stateMACAt(records, s.auditSequence, s.auditHead)
+}
+func (s *sqliteStore) stateMACAt(records map[string]storedPrincipal, sequence uint64, head string) []byte {
 	ids := make([]string, 0, len(records))
 	for id := range records {
 		ids = append(ids, id)
@@ -225,11 +265,7 @@ func (s *sqliteStore) stateMAC(records map[string]storedPrincipal) []byte {
 	for _, id := range ids {
 		ordered = append(ordered, records[id])
 	}
-	encoded, _ := json.Marshal(struct {
-		Version  int
-		Topology []byte
-		Records  []storedPrincipal
-	}{2, s.topology, ordered})
+	encoded := s.canonicalState(ordered, sequence, head)
 	m := hmac.New(sha256.New, s.macKey)
 	m.Write(encoded)
 	return m.Sum(nil)
@@ -238,10 +274,10 @@ func writePrincipal(ctx context.Context, tx *sql.Tx, r storedPrincipal, initiali
 	allowed, _ := json.Marshal(r.Allowed)
 	var err error
 	if initialize {
-		_, err = tx.ExecContext(ctx, "INSERT INTO principals VALUES(?,?,?,?,?,?,?,?)", r.UserID, r.Tenant, r.Principal, r.TokenHash, expiryText(r.TokenExpiresAt), r.Version, r.Disabled, string(allowed))
+		_, err = tx.ExecContext(ctx, "INSERT INTO principals VALUES(?,?,?,?,?,?,?,?,?,?,?)", r.UserID, r.Tenant, r.Principal, r.TokenHash, expiryText(r.TokenExpiresAt), r.Version, r.Disabled, string(allowed), r.EntryGeneration, r.EntryRevoked, r.EntryStrong)
 	} else {
 		var result sql.Result
-		result, err = tx.ExecContext(ctx, "UPDATE principals SET policy_version=?,disabled=?,allowed=? WHERE user_id=?", r.Version, r.Disabled, string(allowed), r.UserID)
+		result, err = tx.ExecContext(ctx, "UPDATE principals SET policy_version=?,disabled=?,allowed=?,token_hash=?,token_expires_at=?,entry_generation=?,entry_revoked=?,entry_strong=? WHERE user_id=?", r.Version, r.Disabled, string(allowed), r.TokenHash, expiryText(r.TokenExpiresAt), r.EntryGeneration, r.EntryRevoked, r.EntryStrong, r.UserID)
 		if err == nil {
 			n, e := result.RowsAffected()
 			if e != nil || n != 1 {
@@ -281,8 +317,9 @@ func (s *sqliteStore) initialize(ctx context.Context, g *Gateway) error {
 			return err
 		}
 	}
-	check := s.aead.Seal(nil, nil, []byte("mcp-entry-state-v2"), s.topology)
-	if _, err = tx.ExecContext(ctx, "INSERT INTO meta VALUES(1,2,?,?,?)", s.topology, check, s.stateMAC(s.records)); err != nil {
+	s.auditIDCipher = s.aead.Seal(nil, nil, g.auditIDKey, s.auditIDAAD())
+	check := s.aead.Seal(nil, nil, []byte("mcp-entry-state-v4"), s.topology)
+	if _, err = tx.ExecContext(ctx, "INSERT INTO meta VALUES(1,4,?,?,?,0,?,?,0,'','')", s.topology, check, s.stateMAC(s.records), "", s.auditIDCipher); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -297,17 +334,26 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 	if err := s.conn.QueryRowContext(ctx, "SELECT version,topology,key_check,state_mac FROM meta WHERE id=1").Scan(&version, &topology, &check, &mac); err != nil {
 		return ErrStorage
 	}
-	if version != 2 {
+	if version != 4 && !(s.allowLegacy && (version == 2 || version == 3)) {
 		return ErrStorageVersion
 	}
+	s.version = version
 	if !bytes.Equal(topology, s.topology) {
 		return ErrStorage
 	}
 	plain, err := s.aead.Open(nil, nil, check, s.topology)
-	if err != nil || string(plain) != "mcp-entry-state-v2" {
+	if err != nil || string(plain) != fmt.Sprintf("mcp-entry-state-v%d", version) {
 		return ErrStorage
 	}
-	rows, err := s.conn.QueryContext(ctx, "SELECT user_id,tenant,principal,token_hash,token_expires_at,policy_version,disabled,allowed FROM principals ORDER BY user_id")
+	if err := s.loadLegacyOrCurrentAudit(ctx, g); err != nil {
+		return err
+	}
+	query := "SELECT user_id,tenant,principal,token_hash,token_expires_at,policy_version,disabled,allowed"
+	if s.version == 4 {
+		query += ",entry_generation,entry_revoked,entry_strong"
+	}
+	query += " FROM principals ORDER BY user_id"
+	rows, err := s.conn.QueryContext(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -316,7 +362,12 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 		var version int64
 		var disabled int
 		var allowed, expiry string
-		if err = rows.Scan(&r.UserID, &r.Tenant, &r.Principal, &r.TokenHash, &expiry, &version, &disabled, &allowed); err != nil {
+		entryGeneration, revoked, strong := int64(1), 0, 0
+		dest := []any{&r.UserID, &r.Tenant, &r.Principal, &r.TokenHash, &expiry, &version, &disabled, &allowed}
+		if s.version == 4 {
+			dest = append(dest, &entryGeneration, &revoked, &strong)
+		}
+		if err = rows.Scan(dest...); err != nil {
 			rows.Close()
 			return err
 		}
@@ -326,8 +377,7 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 			return ErrStorage
 		}
 		p, exists := g.principals[r.UserID]
-		token := g.entryTokens[r.UserID]
-		if !exists || len(s.records) >= len(g.principals) || p.identity != (Identity{r.Tenant, r.Principal}) || !bytes.Equal(r.TokenHash, token[:]) || !r.TokenExpiresAt.Equal(g.users[r.UserID].TokenExpiresAt) || version < 1 || (disabled != 0 && disabled != 1) || len(allowed) > 512<<10 {
+		if !exists || len(s.records) >= len(g.principals) || p.identity != (Identity{r.Tenant, r.Principal}) || len(r.TokenHash) != 32 || entryGeneration < 1 || revoked < 0 || revoked > 1 || strong < 0 || strong > 1 || version < 1 || (disabled != 0 && disabled != 1) || len(allowed) > 512<<10 {
 			rows.Close()
 			return ErrStorage
 		}
@@ -341,6 +391,7 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 				return ErrStorage
 			}
 		}
+		r.EntryGeneration, r.EntryRevoked, r.EntryStrong = uint64(entryGeneration), revoked == 1, strong == 1
 		r.Version = uint64(version)
 		r.Disabled = disabled == 1
 		s.records[r.UserID] = r
@@ -390,7 +441,7 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 		if len(r.Bindings) != len(g.systems) {
 			return ErrStorage
 		}
-		p := &principalState{identity: Identity{r.Tenant, r.Principal}, version: r.Version, disabled: r.Disabled, allowed: append([]string(nil), r.Allowed...), bindings: map[string]*bindingRecord{}}
+		p := &principalState{entry: EntryInfo{Generation: r.EntryGeneration, Revoked: r.EntryRevoked, ExpiresAt: r.TokenExpiresAt}, identity: Identity{r.Tenant, r.Principal}, version: r.Version, disabled: r.Disabled, allowed: append([]string(nil), r.Allowed...), bindings: map[string]*bindingRecord{}}
 		for _, sb := range r.Bindings {
 			b := &bindingRecord{info: BindingInfo{ID: sb.ID, Tenant: r.Tenant, Principal: r.Principal, System: sb.System, Generation: sb.Generation, State: sb.State, ExpiresAt: sb.ExpiresAt}}
 			secret, err := s.aead.Open(nil, nil, sb.Credential, bindingAAD(id, p, b))
@@ -403,12 +454,19 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 			}
 			p.bindings[sb.System] = b
 		}
+		var digest [32]byte
+		copy(digest[:], r.TokenHash)
+		g.entryTokens[id] = digest
+		g.entryStrong[id] = r.EntryStrong
+		u := g.users[id]
+		u.TokenExpiresAt = r.TokenExpiresAt
+		g.users[id] = u
 		restored[id] = p
 	}
 	g.principals = restored
 	return nil
 }
-func (s *sqliteStore) persist(g *Gateway, id string, p *principalState) error {
+func (s *sqliteStore) persist(g *Gateway, id string, p *principalState, event AuditEvent) error {
 	r, err := s.record(g, id, p)
 	if err != nil {
 		return err
@@ -428,18 +486,18 @@ func (s *sqliteStore) persist(g *Gateway, id string, p *principalState) error {
 	if err = writePrincipal(ctx, tx, r, false); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, "UPDATE meta SET state_mac=? WHERE id=1", s.stateMAC(next))
+	sequence, head, err := s.writeAudit(ctx, tx, event)
 	if err != nil {
 		return err
 	}
-	n, err := result.RowsAffected()
-	if err != nil || n != 1 {
-		return ErrStorage
+	if err = s.updateAuditManifest(ctx, tx, next, sequence, head); err != nil {
+		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
 	s.records = next
+	s.auditSequence, s.auditHead = sequence, head
 	return nil
 }
 
@@ -453,12 +511,24 @@ func clonePrincipal(p *principalState) *principalState {
 	}
 	return &copy
 }
-func (g *Gateway) publishPrincipalLocked(id string, p *principalState, system string) error {
+func (g *Gateway) publishPrincipalLocked(id string, p *principalState, system string, action AuditAction, own bool) error {
+	if !g.auditRoomLocked(1) {
+		return ErrAuditFull
+	}
+	actor := AuditActorOperator
+	if own {
+		actor = AuditActorEntry
+	}
+	event := g.auditEventLocked(id, system, "", p, action, AuditPhaseCommit, AuditResultSuccess, actor)
 	if g.store != nil {
-		if err := g.store.persist(g, id, p); err != nil {
-			g.closeLocked()
+		if err := g.store.persist(g, id, p, event); err != nil {
+			g.auditFailureLocked()
 			return ErrStorage
 		}
+	}
+	if err := g.auditRing.Append(event); err != nil {
+		g.auditFailureLocked()
+		return ErrStorage
 	}
 	g.principals[id] = p
 	g.invalidateLocked(id, system)
@@ -486,7 +556,23 @@ func (g *Gateway) closeLocked() error {
 
 // Close stops admission and cancels in-flight operations best effort. It releases
 // SQLite ownership, but does not promise downstream rollback or secure erasure.
-func (g *Gateway) Close() error { g.mu.Lock(); defer g.mu.Unlock(); return g.closeLocked() }
+func (g *Gateway) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	g.mu.Lock()
+	g.closed = true
+	if g.closingContext == nil {
+		g.closingContext = ctx
+	}
+	for _, op := range g.operations {
+		op.cancel()
+	}
+	g.mu.Unlock()
+	g.operationWG.Wait()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closeLocked()
+}
 
 func expiryText(t time.Time) string {
 	if t.IsZero() {

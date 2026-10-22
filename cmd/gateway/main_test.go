@@ -125,3 +125,18 @@ func TestAccountCommandPreflight(t *testing.T) {
 		t.Fatal("invalid account auth created store", err)
 	}
 }
+
+func TestAuditOptionsBoundedAndOffline(t *testing.T) {
+	base := []string{"-operation", "audit", "-db", "x", "-key-stdin", "-tenant", "demo", "-principal", "alice"}
+	if _, err := parseOptions(append(base, "-after-sequence", "2", "-limit", "10"), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, extra := range [][]string{{"-limit", "0"}, {"-limit", "1001"}, {"-system", "crm"}, {"-expected-version", "0"}, {"-init-db=false"}, {"-listen", "127.0.0.1:0"}} {
+		if _, err := parseOptions(append(append([]string{}, base...), extra...), io.Discard); err == nil {
+			t.Fatalf("accepted %v", extra)
+		}
+	}
+	if _, err := parseOptions([]string{"-limit", "10"}, io.Discard); err == nil {
+		t.Fatal("serve accepted audit flag")
+	}
+}

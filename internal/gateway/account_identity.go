@@ -16,7 +16,7 @@ func bindingUsable(b *bindingRecord) bool {
 }
 func (g *Gateway) principalUsableLocked(id string) bool {
 	p := g.principals[id]
-	if g.closed || p == nil || p.disabled {
+	if g.closed || g.maintenance || p == nil || p.disabled || p.entry.Revoked {
 		return false
 	}
 	expiry := g.users[id].TokenExpiresAt
@@ -121,6 +121,18 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 		g.mu.Unlock()
 		return discoveryFailure(id, system, "credential unavailable", nil)
 	}
+	permit, err := g.limiter.acquire(ctx, p.identity, system)
+	if err != nil {
+		g.mu.Unlock()
+		return discoveryFailure(id, system, "discovery admission limited", err)
+	}
+	started := time.Now()
+	event, err := g.startAuditLocked(id, system, "", AuditActionDiscovery)
+	if err != nil {
+		permit.Release()
+		g.mu.Unlock()
+		return discoveryFailure(id, system, "audit unavailable", err)
+	}
 	generation, version, token := b.info.Generation, p.version, b.credential
 	key := discoveryKey{id, system}
 	if previous, ok := g.operations[g.discoveryEpoch[key]]; ok {
@@ -131,12 +143,13 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 	opID := g.nextOperation
 	g.discoveryEpoch[key] = opID
 	g.operations[opID] = admittedOperation{id, system, cancel}
+	g.operationWG.Add(1)
 	connection := g.systems[system]
 	g.mu.Unlock()
 	entries, err := g.discover(opCtx, connection, token)
+	g.finishOperation(opID, event, started, err, false, permit)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	delete(g.operations, opID)
 	cancel()
 	p = g.principals[id]
 	b = p.bindings[system]

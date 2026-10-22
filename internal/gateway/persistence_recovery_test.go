@@ -182,7 +182,7 @@ func TestPersistenceRecoveryRejectsUnsafeStartup(t *testing.T) {
 		recoveryClose(t, g)
 		recoveryReject(t, cfg, opts)
 	})
-	for _, kind := range []string{"endpoint", "scope", "user removed", "user added", "entry token", "auth mode"} {
+	for _, kind := range []string{"endpoint", "scope", "user removed", "user added", "auth mode"} {
 		t.Run(kind, func(t *testing.T) {
 			cfg := recoveryConfig(f)
 			opts := recoveryOptions(t)
@@ -200,10 +200,6 @@ func TestPersistenceRecoveryRejectsUnsafeStartup(t *testing.T) {
 				delete(cfg.Users, "east-user")
 			case "user added":
 				cfg.Users["new-user"] = gateway.User{Token: "synthetic-new-token"}
-			case "entry token":
-				u := cfg.Users["east-user"]
-				u.Token = "synthetic-new-token"
-				cfg.Users["east-user"] = u
 			case "auth mode":
 				cfg.Systems[0].Auth = gateway.AuthConfig{Mode: "raw"}
 			}
@@ -357,7 +353,7 @@ func TestPersistenceRecoveryFailedCommitPoisonsWithoutAcknowledgement(t *testing
 			oldPolicy, _ := g.Policy(revocationEast)
 			oldBinding, _ := g.Binding(revocationEast, "shared")
 			recoveryClose(t, g)
-			recoverySQL(t, opts.Path, "CREATE TRIGGER recovery_fail_final_update BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'synthetic persistence failure'); END")
+			recoverySQL(t, opts.Path, "CREATE TRIGGER recovery_fail_final_update BEFORE UPDATE ON meta WHEN EXISTS (SELECT 1 FROM audit WHERE sequence=NEW.audit_sequence AND json_extract(event, '$.phase')='commit') BEGIN SELECT RAISE(ABORT, 'synthetic persistence failure'); END")
 			opts.Initialize = false
 			g = recoveryOpen(t, cfg, opts)
 			_ = g.Refresh(discoveryContext(t))

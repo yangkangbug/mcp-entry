@@ -19,16 +19,19 @@ var (
 
 // Config is deliberately a local, synthetic-credential configuration, not a vault.
 type Config struct {
+	Limits  LimitsConfig    `json:"limits,omitempty"`
+	Audit   AuditConfig     `json:"audit,omitempty"`
 	Systems []System        `json:"systems"`
 	Users   map[string]User `json:"users"`
 }
 
 type System struct {
-	Name      string         `json:"name"`
-	Endpoint  string         `json:"endpoint"`
-	Auth      AuthConfig     `json:"auth,omitempty"`
-	Network   *NetworkPolicy `json:"network,omitempty"`
-	transport http.RoundTripper
+	QuotaSubject string         `json:"quota_subject,omitempty"`
+	Name         string         `json:"name"`
+	Endpoint     string         `json:"endpoint"`
+	Auth         AuthConfig     `json:"auth,omitempty"`
+	Network      *NetworkPolicy `json:"network,omitempty"`
+	transport    http.RoundTripper
 }
 
 // AuthConfig selects a single administrator-configured credential header.

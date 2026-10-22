@@ -39,20 +39,31 @@ type snapshot struct {
 	handlers map[string]http.Handler
 }
 type Gateway struct {
-	closed         bool
-	store          *sqliteStore
-	entryTokens    map[string][32]byte
-	entryStrong    map[string]bool
-	discoveryEpoch map[discoveryKey]uint64
-	mu             sync.Mutex
-	principals     map[string]*principalState
-	identities     map[Identity]string
-	operations     map[uint64]admittedOperation
-	nextOperation  uint64
-	systems        map[string]System
-	users          map[string]User
-	refreshMu      sync.Mutex
-	state          atomic.Pointer[snapshot]
+	auditArchivedUnfinished uint64
+	limiter                 *admissionLimiter
+	operationWG             sync.WaitGroup
+	closingContext          context.Context
+	auditRing               *AuditRing
+	maintenance             bool
+	auditUnfinished         map[string]bool
+	auditIDKey              []byte
+	auditCapacity           int
+	auditPending            uint64
+	auditFault              bool
+	closed                  bool
+	store                   *sqliteStore
+	entryTokens             map[string][32]byte
+	entryStrong             map[string]bool
+	discoveryEpoch          map[discoveryKey]uint64
+	mu                      sync.Mutex
+	principals              map[string]*principalState
+	identities              map[Identity]string
+	operations              map[uint64]admittedOperation
+	nextOperation           uint64
+	systems                 map[string]System
+	users                   map[string]User
+	refreshMu               sync.Mutex
+	state                   atomic.Pointer[snapshot]
 }
 
 // DiscoveryIssue contains no credentials, raw downstream errors or tool descriptions.
@@ -64,7 +75,8 @@ type DiscoveryIssue struct {
 }
 
 // New copies configuration. Nothing is published until Refresh discovers authorized tools.
-func New(cfg Config) (*Gateway, error) {
+func New(cfg Config) (*Gateway, error) { return newGateway(cfg, true) }
+func newGateway(cfg Config, bootstrap bool) (*Gateway, error) {
 	if len(cfg.Systems) > 16 || len(cfg.Users) > 64 {
 		return nil, errors.New("demo configuration exceeds system/user limit")
 	}
@@ -95,10 +107,16 @@ func New(cfg Config) (*Gateway, error) {
 	}
 	tokens := map[string]bool{}
 	for id, user := range cfg.Users {
+		if !bootstrap {
+			user.Token = ""
+			user.TokenExpiresAt = time.Time{}
+			user.Allowed = nil
+			user.Credentials = nil
+		}
 		if !validExpiryDate(user.TokenExpiresAt.UTC()) {
 			return nil, errors.New("invalid entry credential expiry")
 		}
-		if id == "" || len(id) > 128 || user.Token == "" || len(user.Token) > 4096 || strings.ContainsAny(user.Token, "\r\n") || tokens[user.Token] {
+		if id == "" || len(id) > 128 || (bootstrap && (user.Token == "" || len(user.Token) > 4096 || strings.ContainsAny(user.Token, "\r\n") || tokens[user.Token])) {
 			return nil, errors.New("invalid demo identity")
 		}
 		tokens[user.Token] = true
@@ -122,11 +140,29 @@ func New(cfg Config) (*Gateway, error) {
 	if err := g.initializeIdentities(); err != nil {
 		return nil, err
 	}
+	if err := g.initializeAudit(cfg.Audit); err != nil {
+		return nil, err
+	}
+	identities := []Identity{}
+	for identity := range g.identities {
+		identities = append(identities, identity)
+	}
+	subjects := map[string]string{}
+	for name, system := range g.systems {
+		subjects[name] = system.QuotaSubject
+	}
+	limiter, err := newAdmissionLimiter(cfg.Limits, identities, subjects)
+	if err != nil {
+		return nil, err
+	}
+	g.limiter = limiter
 	g.entryTokens = map[string][32]byte{}
 	g.entryStrong = map[string]bool{}
 	g.discoveryEpoch = map[discoveryKey]uint64{}
 	for id, user := range g.users {
-		g.entryTokens[id] = entryTokenDigest(user.Token)
+		if bootstrap {
+			g.entryTokens[id] = entryTokenDigest(user.Token)
+		}
 		decoded, err := base64.RawURLEncoding.Strict().DecodeString(user.Token)
 		g.entryStrong[id] = err == nil && len(decoded) == 32
 		user.Token = ""
@@ -450,7 +486,7 @@ func validateSchemaTypes(value any) error {
 
 // Call authorizes independently of discovery and validates the discovered input schema.
 // Neither caller arguments nor downstream names can choose an endpoint or credential.
-func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.CallToolResult, error) {
+func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *mcp.CallToolResult, retErr error) {
 	g.mu.Lock()
 	e, exists := g.evaluateLocked(id, name)
 	g.mu.Unlock()
@@ -494,12 +530,25 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.Cal
 		g.mu.Unlock()
 		return nil, err
 	}
+	permit, err := g.limiter.acquire(ctx, g.principals[id].identity, e.system.Name)
+	if err != nil {
+		g.mu.Unlock()
+		return nil, err
+	}
+	started := time.Now()
+	event, err := g.startAuditLocked(id, e.system.Name, name, AuditActionCall)
+	if err != nil {
+		permit.Release()
+		g.mu.Unlock()
+		return nil, err
+	}
 	token := g.principals[id].bindings[e.system.Name].credential
 	g.nextOperation++
 	opID := g.nextOperation
 	g.operations[opID] = admittedOperation{id, e.system.Name, cancel}
+	g.operationWG.Add(1)
 	g.mu.Unlock()
-	defer func() { g.mu.Lock(); delete(g.operations, opID); g.mu.Unlock() }()
+	defer func() { g.finishOperation(opID, event, started, retErr, result != nil && result.IsError, permit) }()
 	ctx, observation := withFailureObservation(ctx)
 	observation.setPhase(FailureConnect)
 	session, err := connect(ctx, e.system, token)
@@ -510,7 +559,7 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.Cal
 	// complete discovery result or a confirmed tool outcome.
 	defer func() { observation.setPhase(FailureCleanup); session.Close() }()
 	observation.setPhase(FailureCall)
-	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: e.original, Arguments: json.RawMessage(data)})
+	result, err = session.CallTool(ctx, &mcp.CallToolParams{Name: e.original, Arguments: json.RawMessage(data)})
 	if err != nil {
 		return nil, classifyDownstreamFailure(ctx, FailureCall, err, true)
 	}

@@ -27,11 +27,15 @@ func (t *toolFlags) String() string         { return "" }
 func (t *toolFlags) Set(value string) error { *t = append(*t, value); return nil }
 
 type options struct {
+	archiveFile                                                       string
+	entryFile, entryExpiry, newKeyFile                                string
 	allowRemoteTest, allowInsecureHTTPTest                            bool
 	tlsCert, tlsKey                                                   string
 	config, listen, db, keyFile, operation, tenant, principal, system string
 	keyStdin, initialize, account                                     bool
 	expected                                                          uint64
+	after                                                             uint64
+	limit                                                             int
 	allowed                                                           toolFlags
 }
 
@@ -52,11 +56,17 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 	fs.BoolVar(&o.keyStdin, "key-stdin", false, "read exactly 32 raw synthetic key bytes followed by EOF from stdin")
 	fs.BoolVar(&o.account, "account", false, "serve only: enable local own-binding page; requires strong finite entry credentials")
 	fs.BoolVar(&o.initialize, "init-db", false, "serve only: explicitly initialize a nonexistent database")
-	fs.StringVar(&o.operation, "operation", "serve", "serve, status, revoke-binding, disable-principal, or set-policy")
+	fs.StringVar(&o.operation, "operation", "serve", "serve, status, audit, audit-all, archive-audit, migrate, rotate-key, replace-entry, revoke-entry, revoke-binding, disable-principal, or set-policy")
 	fs.StringVar(&o.tenant, "tenant", "", "offline only: configured synthetic tenant")
 	fs.StringVar(&o.principal, "principal", "", "offline only: configured synthetic principal")
 	fs.StringVar(&o.system, "system", "", "revoke-binding requires system; status optionally filters system")
-	fs.Uint64Var(&o.expected, "expected-version", 0, "mutation CAS: binding generation for revoke, policy version otherwise")
+	fs.Uint64Var(&o.expected, "expected-version", 0, "mutation CAS: entry generation for entry operations, binding generation for revoke-binding, audit sequence for archive-audit, policy version otherwise")
+	fs.Uint64Var(&o.after, "after-sequence", 0, "audit only: exclusive sequence cursor")
+	fs.IntVar(&o.limit, "limit", 100, "audit only: maximum records, 1 through 1000")
+	fs.StringVar(&o.entryFile, "entry-file", "", "replace-entry only: private file with exactly 43 canonical base64url token bytes")
+	fs.StringVar(&o.entryExpiry, "entry-expires", "", "replace-entry only: finite future RFC3339 expiry")
+	fs.StringVar(&o.archiveFile, "archive-file", "", "archive-audit only: nonexistent private export path")
+	fs.StringVar(&o.newKeyFile, "new-key-file", "", "rotate-key only: private file with exactly 32 new raw key bytes")
 	fs.Var(&o.allowed, "allow", "set-policy only: repeat for each full tool name; omission clears policy")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -79,6 +89,18 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 			return o, errOptions
 		}
 	} else if (o.keyFile != "") == o.keyStdin {
+		return o, errOptions
+	}
+	if o.operation != "archive-audit" && seen["archive-file"] {
+		return o, errOptions
+	}
+	if o.operation != "replace-entry" && (seen["entry-file"] || seen["entry-expires"]) {
+		return o, errOptions
+	}
+	if o.operation != "rotate-key" && seen["new-key-file"] {
+		return o, errOptions
+	}
+	if o.operation != "audit" && o.operation != "audit-all" && (seen["after-sequence"] || seen["limit"]) {
 		return o, errOptions
 	}
 	if o.operation == "serve" {
@@ -109,10 +131,40 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 		}
 		return o, nil
 	}
-	if seen["allow-remote-test"] || seen["allow-insecure-http-test"] || seen["tls-cert"] || seen["tls-key"] || seen["listen"] || seen["init-db"] || seen["account"] || o.db == "" || o.tenant == "" || o.principal == "" {
+	if seen["allow-remote-test"] || seen["allow-insecure-http-test"] || seen["tls-cert"] || seen["tls-key"] || seen["listen"] || seen["init-db"] || seen["account"] || o.db == "" {
+		return o, errOptions
+	}
+	globalOperation := o.operation == "migrate" || o.operation == "rotate-key" || o.operation == "audit-all" || o.operation == "archive-audit"
+	if globalOperation {
+		if seen["tenant"] || seen["principal"] || seen["system"] || (seen["expected-version"] && o.operation != "archive-audit") || seen["allow"] {
+			return o, errOptions
+		}
+	} else if o.tenant == "" || o.principal == "" {
 		return o, errOptions
 	}
 	switch o.operation {
+	case "archive-audit":
+		if o.archiveFile == "" || !seen["expected-version"] {
+			return o, errOptions
+		}
+	case "migrate":
+	case "rotate-key":
+		if o.newKeyFile == "" {
+			return o, errOptions
+		}
+	case "replace-entry":
+		expiry, e := time.Parse(time.RFC3339, o.entryExpiry)
+		if o.expected == 0 || o.entryFile == "" || e != nil || !expiry.After(time.Now()) || seen["system"] || seen["allow"] {
+			return o, errOptions
+		}
+	case "revoke-entry":
+		if o.expected == 0 || seen["system"] || seen["allow"] {
+			return o, errOptions
+		}
+	case "audit", "audit-all":
+		if seen["system"] || seen["expected-version"] || seen["allow"] || o.limit < 1 || o.limit > gateway.MaxAuditReadLimit {
+			return o, errOptions
+		}
 	case "status":
 		if seen["expected-version"] || seen["allow"] {
 			return o, errOptions
@@ -169,6 +221,52 @@ func operate(g *gateway.Gateway, cfg gateway.Config, o options, output io.Writer
 	var result any
 	var err error
 	switch o.operation {
+	case "archive-audit":
+		result, err = g.ArchiveAudit(o.archiveFile, o.expected)
+	case "migrate":
+		result = struct{ Version int }{4}
+	case "rotate-key":
+		var key []byte
+		key, err = readKey(options{db: "maintenance", keyFile: o.newKeyFile}, nil)
+		if err == nil {
+			err = g.RotateKey(key)
+			if errors.Is(err, gateway.ErrStorage) {
+				err = errors.New("key rotation outcome unknown; retain both keys and authenticate reopen with the new key, then the old key before retrying; if neither succeeds, quarantine the database")
+			}
+			if err == nil {
+				err = g.Close()
+				if err == nil {
+					var verified *gateway.Gateway
+					verified, err = gateway.OpenMaintenance(cfg, gateway.PersistenceOptions{Path: o.db, Key: key})
+					if err == nil {
+						err = verified.Close()
+					}
+				}
+				if err != nil {
+					err = errors.New("key rotation verification failed; retain both keys and inspect state before retrying")
+				}
+			}
+		}
+		clear(key)
+		result = struct{ Rotated bool }{err == nil}
+	case "replace-entry":
+		var token string
+		token, err = readEntryFile(o.entryFile)
+		if err == nil {
+			expiry, _ := time.Parse(time.RFC3339, o.entryExpiry)
+			result, err = g.ReplaceEntry(identity, o.expected, token, expiry)
+		}
+	case "revoke-entry":
+		result, err = g.RevokeEntry(identity, o.expected)
+	case "audit-all":
+		result, err = g.AuditAll(o.after, o.limit)
+	case "audit":
+		var page gateway.AuditPage
+		page, err = g.Audit(identity, o.after, o.limit)
+		result = struct {
+			Status gateway.AuditStatus
+			Page   gateway.AuditPage
+		}{g.AuditStatus(), page}
 	case "status":
 		policy, e := g.Policy(identity)
 		if e != nil {
@@ -188,10 +286,15 @@ func operate(g *gateway.Gateway, cfg gateway.Config, o options, output io.Writer
 		if o.system != "" && len(bindings) == 0 {
 			return gateway.ErrDenied
 		}
+		entry, e := g.Entry(identity)
+		if e != nil {
+			return e
+		}
 		result = struct {
 			Policy   gateway.PolicyInfo
 			Bindings []gateway.BindingInfo
-		}{policy, bindings}
+			Entry    gateway.EntryInfo
+		}{policy, bindings, entry}
 	case "revoke-binding":
 		result, err = g.RevokeBinding(identity, o.system, o.expected)
 	case "disable-principal":
@@ -241,7 +344,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if o.account || o.allowRemoteTest {
+	if (o.account || o.allowRemoteTest) && (o.db == "" || o.initialize) {
 		preview, err := gateway.New(cfg)
 		if err != nil {
 			return err
@@ -267,7 +370,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	defer clear(key)
 	var g *gateway.Gateway
 	if o.db != "" {
-		g, err = gateway.NewPersistent(cfg, gateway.PersistenceOptions{Path: o.db, Key: key, Initialize: o.initialize})
+		opts := gateway.PersistenceOptions{Path: o.db, Key: key, Initialize: o.initialize, Migrate: o.operation == "migrate"}
+		if o.operation == "serve" {
+			g, err = gateway.NewPersistent(cfg, opts)
+		} else {
+			g, err = gateway.OpenMaintenance(cfg, opts)
+		}
 	} else {
 		g, err = gateway.New(cfg)
 	}
@@ -401,4 +509,26 @@ func readServerTLS(certPath, keyPath string) (*tls.Config, error) {
 		return nil, errors.New("invalid TLS certificate or private key")
 	}
 	return &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{pair}}, nil
+}
+
+func readEntryFile(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() != 43 {
+		return "", errors.New("invalid private entry token file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", errors.New("cannot read entry token file")
+	}
+	defer file.Close()
+	actual, err := file.Stat()
+	if err != nil || !os.SameFile(info, actual) || !actual.Mode().IsRegular() || actual.Mode().Perm()&0077 != 0 {
+		return "", errors.New("invalid private entry token file")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, 44))
+	if err != nil || len(data) != 43 {
+		return "", errors.New("entry token file must contain exactly 43 bytes")
+	}
+	defer clear(data)
+	return string(data), nil
 }

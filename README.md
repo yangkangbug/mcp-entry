@@ -146,10 +146,14 @@ CI 使用 go.mod 的 Go 版本执行格式、模块验证、测试、race、vet 
 
 固定明文 token 只是演示身份，不是可信生产认证。入口默认仅允许回环 HTTP；远程合成测试必须显式开启并满足入口凭据要求，明文另需危险许可开关。/mcp 拒绝浏览器 Origin，显式开启的 /account 只接受固定同源访问。下游可按允许列表启用 HTTPS，或显式允许仅供合成测试的 HTTP。拒绝重定向、外部/动态 schema 引用及递归引用，不适用于部署公网服务。工具描述、注解与返回内容仍是不可信外部数据；不提供提示注入净化保证。
 
-尚未完成：OAuth/OIDC、真实账号网页绑定、生产凭证库与密钥轮换/备份恢复、管理界面、真实系统集成、多副本撤权、审计和限流、公网入口 TLS 与密钥轮换。不代理 resources、prompts、sampling、任务扩展或任意远程 MCP 地址。已支持[有界的同文档 schema 引用](docs/schema-references.md)，后续持续完善兼容性回归，并单独设计真实认证和生产凭证生命周期；当前不启用真实写操作。
+尚未完成：OAuth/OIDC、真实账号网页绑定、生产凭证库与安全备份恢复、管理界面、真实系统集成、多副本撤权、完整入口负载治理、生产密钥管理及完整审计覆盖。不代理 resources、prompts、sampling、任务扩展或任意远程 MCP 地址。已支持[有界的同文档 schema 引用](docs/schema-references.md)，后续持续完善兼容性回归，并单独设计真实认证和生产凭证生命周期；当前不启用真实写操作。
 
 ## 协议依据
 
 2026-10-22 核对官方 [Go SDK](https://github.com/modelcontextprotocol/go-sdk) 与 [v1.7.0 go.mod](https://github.com/modelcontextprotocol/go-sdk/blob/v1.7.0/go.mod)。SDK 支持 MCP 2026-07-28，并兼容 2025-11-25、2025-06-18、2025-03-26 和 2024-11-05。这里使用其 tools/list、tools/call 和 Streamable HTTP 子集，不声称全协议一致性认证。
 
 项目许可证尚未选定，暂不添加 LICENSE。第三方依赖遵循各自许可证。
+
+已实现有界出站限额与事务性元数据审计，范围及未完成项见[审计与准入](docs/audit-limits.md)。
+
+离线入口 token 替换/撤销、v2/v3 认证迁移、根密钥轮换及审计归档见[维护说明](docs/maintenance.md)。这些是合成测试能力，不等于生产密钥托管或备份反回滚。

@@ -108,8 +108,13 @@ func TestIntegratedPersistentExpiry(t *testing.T) {
 	user := cfg.Users["alice"]
 	user.TokenExpiresAt = user.TokenExpiresAt.Add(time.Hour)
 	changed.Users["alice"] = user
-	if reopened, err := NewPersistent(changed, opts); err == nil {
-		reopened.Close()
+	reopened, err := NewPersistent(changed, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	info, err := reopened.Entry(Identity{Tenant: "demo", Principal: "alice"})
+	if err != nil || !info.ExpiresAt.Equal(cfg.Users["alice"].TokenExpiresAt) {
 		t.Fatal("entry expiry changed on reopen")
 	}
 }

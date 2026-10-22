@@ -42,6 +42,7 @@ type bindingRecord struct {
 	credential string
 }
 type principalState struct {
+	entry    EntryInfo
 	identity Identity
 	version  uint64
 	allowed  []string
@@ -71,7 +72,7 @@ func (g *Gateway) initializeIdentities() error {
 		if _, exists := g.identities[identity]; exists {
 			return errors.New("duplicate identity scope")
 		}
-		p := &principalState{identity: identity, version: 1, allowed: append([]string(nil), user.Allowed...), bindings: map[string]*bindingRecord{}}
+		p := &principalState{entry: EntryInfo{Generation: 1, ExpiresAt: user.TokenExpiresAt}, identity: identity, version: 1, allowed: append([]string(nil), user.Allowed...), bindings: map[string]*bindingRecord{}}
 		for name := range g.systems {
 			state := BindingUnbound
 			if user.Credentials[name] != "" {
@@ -157,7 +158,7 @@ func (g *Gateway) replaceBinding(identity Identity, system string, expected uint
 	b.info.State = BindingActive
 	b.info.ExpiresAt = expiresAt.UTC()
 	b.credential = credential
-	if err := g.publishPrincipalLocked(id, p, system); err != nil {
+	if err := g.publishPrincipalLocked(id, p, system, AuditActionBindingReplace, own); err != nil {
 		return BindingInfo{}, err
 	}
 	return b.info, nil
@@ -187,7 +188,7 @@ func (g *Gateway) revokeBinding(identity Identity, system string, expected uint6
 	b.info.Generation++
 	b.info.State = BindingRevoked
 	b.credential = ""
-	if err := g.publishPrincipalLocked(id, p, system); err != nil {
+	if err := g.publishPrincipalLocked(id, p, system, AuditActionBindingRevoke, own); err != nil {
 		return BindingInfo{}, err
 	}
 	return b.info, nil
@@ -216,7 +217,7 @@ func (g *Gateway) SetPolicy(identity Identity, expected uint64, allowed []string
 	p = clonePrincipal(p)
 	p.version++
 	p.allowed = append([]string(nil), allowed...)
-	if err := g.publishPrincipalLocked(id, p, ""); err != nil {
+	if err := g.publishPrincipalLocked(id, p, "", AuditActionPolicyUpdate, false); err != nil {
 		return PolicyInfo{}, err
 	}
 	return policyInfo(p), nil
@@ -239,7 +240,7 @@ func (g *Gateway) DisablePrincipal(identity Identity, expected uint64) (PolicyIn
 		b.info.State = BindingRevoked
 		b.credential = ""
 	}
-	if err := g.publishPrincipalLocked(id, p, ""); err != nil {
+	if err := g.publishPrincipalLocked(id, p, "", AuditActionPrincipalDisable, false); err != nil {
 		return PolicyInfo{}, err
 	}
 	return policyInfo(p), nil
