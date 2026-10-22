@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -28,7 +29,7 @@ type entry struct {
 	system   System
 	original string
 	tool     *mcp.Tool
-	input    *jsonschema.Resolved
+	input    *boundedSchema
 }
 type snapshot struct {
 	catalogs map[string]map[string]entry
@@ -180,15 +181,32 @@ func connect(ctx context.Context, endpoint, token string) (*mcp.ClientSession, e
 				if !ok || list == nil {
 					return nil, errors.New("invalid catalog")
 				}
+				if len(list.Tools) > MaxToolsPerSystem {
+					return nil, errors.New("tool count limit")
+				}
+				pageBytes := 0
 				for _, tool := range list.Tools {
 					if tool == nil {
 						return nil, errors.New("null tool")
 					}
-					if err := checkSchemaShape(tool.InputSchema, 0); err != nil {
-						return nil, err
+					data, err := json.Marshal(tool)
+					pageBytes += len(data)
+					if err != nil || len(data) > 64<<10 || pageBytes > 1<<20 {
+						return nil, errors.New("catalog byte limit")
 					}
-					if err := validateSchemaTypes(tool.InputSchema); err != nil {
-						return nil, err
+				}
+				for _, tool := range list.Tools {
+					schemas := []any{tool.InputSchema}
+					if tool.OutputSchema != nil {
+						schemas = append(schemas, tool.OutputSchema)
+					}
+					for _, schema := range schemas {
+						if _, err := analyzeSchema(schema); err != nil {
+							return nil, err
+						}
+						if err := validateSchemaTypes(schema); err != nil {
+							return nil, err
+						}
 					}
 				}
 			}
@@ -278,10 +296,23 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (ma
 	return nil, errors.New("pagination limit")
 }
 
-// Schema references and parameter-to-header mappings are deliberately unsupported.
-// Reject them at schema positions before resolution or SDK annotation processing.
-func resolveSchema(value any, input bool) (*jsonschema.Resolved, error) {
-	if err := checkSchemaShape(value, 0); err != nil {
+// boundedSchema retains the validator's dialect semantics without rewriting the
+// advertised schema. Admission limits are not a wall-clock CPU interruption.
+type boundedSchema struct {
+	resolved *jsonschema.Resolved
+	work     int
+}
+
+func (s *boundedSchema) Validate(value any) error {
+	if err := validateInstanceBudget(value, s.work); err != nil {
+		return err
+	}
+	return s.resolved.Validate(value)
+}
+
+func resolveSchema(value any, input bool) (*boundedSchema, error) {
+	work, err := analyzeSchema(value)
+	if err != nil {
 		return nil, err
 	}
 	if err := validateSchemaTypes(value); err != nil {
@@ -303,7 +334,15 @@ func resolveSchema(value any, input bool) (*jsonschema.Resolved, error) {
 	default:
 		return nil, errors.New("unsupported schema draft")
 	}
-	return schema.Resolve(nil)
+	resolved, err := schema.Resolve(&jsonschema.ResolveOptions{
+		Loader: func(*url.URL) (*jsonschema.Schema, error) {
+			return nil, errors.New("external schema loading disabled")
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &boundedSchema{resolved: resolved, work: work}, nil
 }
 
 // The validator resolves references but does not reject unknown type names.
@@ -313,9 +352,9 @@ func validateSchemaTypes(value any) error {
 	if !ok {
 		return nil
 	}
-	for _, key := range []string{"$ref", "$dynamicRef", "x-mcp-header"} {
+	for _, key := range []string{"$dynamicRef", "x-mcp-header"} {
 		if _, exists := schema[key]; exists {
-			return errors.New("schema references and header mappings unsupported")
+			return errors.New("dynamic references and header mappings unsupported")
 		}
 	}
 	if typ, exists := schema["type"]; exists {
@@ -390,27 +429,6 @@ func validateSchemaTypes(value any) error {
 	return nil
 }
 
-func checkSchemaShape(value any, depth int) error {
-	if depth > 32 {
-		return errors.New("schema depth limit")
-	}
-	switch value := value.(type) {
-	case map[string]any:
-		for _, child := range value {
-			if err := checkSchemaShape(child, depth+1); err != nil {
-				return err
-			}
-		}
-	case []any:
-		for _, child := range value {
-			if err := checkSchemaShape(child, depth+1); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // Call authorizes independently of discovery and validates the discovered input schema.
 // Neither caller arguments nor downstream names can choose an endpoint or credential.
 func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.CallToolResult, error) {
@@ -421,6 +439,9 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.Cal
 	token := g.users[id].Credentials[e.system.Name]
 	if token == "" {
 		return nil, ErrDenied
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if args == nil {
 		args = map[string]any{}
@@ -435,6 +456,9 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.Cal
 	var input any
 	if err := json.Unmarshal(data, &input); err != nil {
 		return nil, errors.New("invalid tool arguments")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := e.input.Validate(input); err != nil {
 		return nil, errors.New("arguments do not match discovered schema")

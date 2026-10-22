@@ -447,7 +447,7 @@ func TestDynamicDiscoveryRejectsEntireMalformedCatalog(t *testing.T) {
 	})
 }
 
-func TestDynamicDiscoveryRejectsSchemaReferences(t *testing.T) {
+func TestDynamicDiscoveryRejectsUnsafeSchemaReferences(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		schema string
@@ -456,7 +456,6 @@ func TestDynamicDiscoveryRejectsSchemaReferences(t *testing.T) {
 		{"root_dynamic_self_ref", `{"type":"object","$dynamicAnchor":"node","$dynamicRef":"#node"}`},
 		{"nested_self_ref", `{"type":"object","properties":{"child":{"$ref":"#"}}}`},
 		{"nested_dynamic_ref", `{"type":"object","properties":{"child":{"$dynamicRef":"#node"}},"$dynamicAnchor":"node"}`},
-		{"local_definition_ref", `{"type":"object","$defs":{"value":{"type":"string"}},"properties":{"value":{"$ref":"#/$defs/value"}}}`},
 		{"array_item_ref", `{"type":"object","properties":{"children":{"type":"array","items":{"$ref":"#"}}}}`},
 		{"composition_ref", `{"type":"object","allOf":[{"$ref":"#"}]}`},
 		{"draft7_dependency_ref", `{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","dependencies":{"value":{"$ref":"#"}}}`},
@@ -477,7 +476,7 @@ func TestDynamicDiscoveryRejectsSchemaReferences(t *testing.T) {
 				// Never call a tool containing a recursive schema. Rejection must
 				// happen during discovery before argument validation is possible.
 				if issues := g.Refresh(discoveryContext(t)); len(issues) == 0 {
-					t.Fatal("unsupported schema reference accepted during discovery")
+					t.Fatal("unsafe schema reference accepted during discovery")
 				}
 				if names := g.Names("alice"); len(names) != 0 {
 					t.Fatalf("reference-bearing system partially published: %v", names)

@@ -35,7 +35,7 @@ Refresh 按确定顺序执行，并原子替换整个目录。失败系统不保
 - 每用户每系统发现最多 16 页、128 个工具、1 MiB 工具定义总量；单工具定义最多 64 KiB。
 - 入口请求体和 Call 参数最多 64 KiB；每次下游 HTTP 响应最多 1 MiB；分页 cursor 最多 4096 字节。
 - 单系统发现 5 秒；命令启动发现总共 30 秒；工具调用上下文 10 秒，HTTP 客户端 12 秒。每个连接的 HTTP 请求、响应读取及有状态 session DELETE 清理都受同一个操作上下文约束，更早的调用方截止时间或取消同样生效。
-- schema 嵌套深度最多 32；仅支持验证器支持的 JSON Schema draft-07/2020-12；输入根必须为 object。所有 schema 位置的 $ref/$dynamicRef（含本地引用）都被拒绝，避免递归引用栈耗尽；不会解析或下载外部引用。
+- schema 原始深度最多 32；仅支持验证器支持的 JSON Schema draft-07/2020-12；输入根必须显式为 object。仅接受有界、无环的同文档 JSON Pointer 引用；拒绝外部、动态及递归引用，不下载外部 schema。详见 [引用准入与限制](schema-references.md)。同步 schema 验证受节点/深度/工作量准入约束，不是可由操作 deadline 强制中断的 CPU 隔离。
 - 暂不支持 schema 位置的 x-mcp-header 参数映射，发现时直接拒绝；普通属性名及 example/default 数据中的同名键不是映射，允许保留。此限制避免不可信 schema 改变传输行为。复杂扩展兼容性不是本阶段目标。
 - 只接受字面回环 HTTP 下游地址，所有 HTTP 重定向被拒绝；入口仅绑定回环且拒绝所有 Origin 浏览器请求。
 - SDK 重连及自动 MultiRoundTrip 均关闭，无应用层工具重试。SDK 的 server/discover 到旧版 initialize 回退属于协议初始化，不是重复 tools/call。

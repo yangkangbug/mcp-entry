@@ -5,7 +5,7 @@
 ## 工具契约
 
 - 发现使用标准 `tools/list` 分页。公开名称为 `系统名__原工具名`；调用时还原原名称。
-- 保留官方 SDK 能表示的工具标题、描述、annotations、`_meta`、icons 和输入/输出 schema。不是未知扩展字段的逐字节透明代理；不支持的 schema 按 [架构限制](architecture.md) 拒绝。
+- 保留官方 SDK 能表示的工具标题、描述、annotations、`_meta`、icons 和输入/输出 schema。不是未知扩展字段的逐字节透明代理；不支持的 schema 按 [架构限制](architecture.md) 与 [引用准入](schema-references.md) 拒绝。
 - 参数按 JSON 语义转发。网关不填充 schema 默认值、不自动设置 `confirm`，不改写业务游标、幂等键、`request_id`、`task_id` 或 `parent_task_id`。JSON 字段顺序及空白不是契约的一部分。
 - 保留下游工具结果的 `content`、`structuredContent`、`isError` 与结果 `_meta`，不追加统一的 message 或成功包装。SDK 按协议添加的 `resultType` 与服务信息元数据不属于业务包装；已有下游服务信息不会被网关身份覆盖。可选 outputSchema 的存在与否保持不变；网关目前不独立验证下游输出。
 - annotations 和工具描述是不可信提示，不替代授权。`readOnlyHint`、`idempotentHint` 等不能开放白名单外工具或触发重试。
