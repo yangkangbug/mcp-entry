@@ -2,6 +2,84 @@
 
 A nonproduction Go MCP gateway: config-driven downstream discovery, per-user tool catalogs, explicit authorization, and isolated synthetic credentials. Uses the official MCP SDK and Streamable HTTP. Local demo only; no OAuth or real account binding yet.
 
+## 当前架构
+
+当前是单个 Go 网关进程，使用官方 MCP SDK 与 Streamable HTTP。下图只展示已实现部分；入口和下游均限回环 HTTP，配置只使用虚构测试身份与凭证。OAuth、账号绑定、凭证保险库与管理界面尚未实现。
+
+```mermaid
+flowchart TB
+    Client["MCP 客户端"]
+    Config["JSON 配置：系统地址、用户 token<br/>工具白名单、按用户和系统划分的虚构凭证"]
+
+    subgraph Gateway["mcp-entry · Go 网关进程"]
+        Entry["/mcp 入口<br/>每次请求验证演示 bearer token"]
+        Discover["启动时 Refresh<br/>按用户、按系统发现并校验工具"]
+        Catalog["每用户独立目录快照<br/>下游可见工具 ∩ 本地明确授权"]
+        Call["调用独立授权与输入 schema 校验<br/>恢复原工具名，选择对应用户凭证"]
+        Entry -->|tools/list| Catalog
+        Entry -->|tools/call| Call
+        Discover -->|原子发布| Catalog
+        Catalog -->|目录成员、固定路由与 schema| Call
+    end
+
+    subgraph Downstream["本地测试 MCP 下游"]
+        CRM["crm 模拟服务"]
+        Docs["docs 模拟服务"]
+    end
+
+    Client -->|Streamable HTTP| Entry
+    Config -.->|身份与策略| Entry
+    Config -.->|连接、凭证与白名单| Discover
+    Config -.->|策略与凭证| Call
+    Discover -->|tools/list · 用户专属凭证| Downstream
+    Call -->|tools/call · 用户专属凭证| Downstream
+```
+
+公开工具名采用 `系统名__原工具名`，例如 `crm__echo`；客户端不能用名称或参数改变下游地址。图中的模块是进程内逻辑，不是额外部署的服务。`cmd/demo` 会启动 crm、docs 模拟服务；`cmd/gateway` 只启动网关，下游需预先运行。
+
+## 发现与请求流程
+
+启动发现与客户端请求是两个阶段。`tools/list` 读取已发布快照，`tools/call` 使用已发现的路由和 schema，不会每次重新发现目录。身份验证失败会立即拒绝请求；以下省略 MCP 连接初始化细节，展示身份有效后的目录与调用路径。
+
+```mermaid
+sequenceDiagram
+    participant C as MCP 客户端
+    participant G as Go 网关
+    participant S as 每用户目录快照
+    participant D as 本地测试 MCP 下游
+
+    Note over G,D: 阶段一：启动时读取配置并执行 Refresh
+    loop 每个用户的获准系统
+        G->>D: tools/list（该用户该系统的虚构凭证，遍历分页）
+        D-->>G: 工具定义、输入和输出 schema
+        G->>G: 校验整个系统目录，添加系统前缀，与白名单取交集
+        Note over G,D: 某系统发现失败则该用户不发布该系统工具
+    end
+    G->>S: 原子发布各用户目录，失败系统不保留旧目录
+
+    Note over C,D: 阶段二：入口就绪后处理客户端请求
+    C->>G: tools/list + 入口 bearer token
+    G->>G: 验证身份
+    G->>S: 读取该用户目录
+    S-->>G: 已授权工具与保留的元数据、schema
+    G-->>C: 返回带系统前缀的工具列表
+
+    C->>G: tools/call（如 crm__echo、参数）+ 入口 bearer token
+    G->>G: 验证身份
+    G->>S: 获取该用户的工具与固定路由
+    S-->>G: 目录成员、原工具名与输入 schema
+    G->>G: 独立检查白名单、目录成员、凭证及输入参数
+    alt 校验通过
+        G->>D: tools/call（恢复原工具名，使用该用户该系统凭证）
+        D-->>G: 工具调用结果
+        G-->>C: 转发结果
+    else 未授权、工具不可用或参数不合法
+        G-->>C: 拒绝调用，不访问下游
+    end
+```
+
+当前命令只在启动时刷新；修改配置或下游工具后需重启。发现失败可以留下其他健康系统的可用目录，但不会放宽授权。详细边界见 [架构与威胁模型](docs/architecture.md)。
+
 ## 已实现
 
 - JSON 配置系统连接与用户策略；使用用户自己的下游凭证执行真实 `tools/list`。
