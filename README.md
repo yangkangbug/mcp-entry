@@ -1,10 +1,10 @@
 # mcp-entry
 
-A nonproduction Go MCP gateway: config-driven downstream discovery, per-user tool catalogs, explicit authorization, and isolated synthetic credentials. Uses the official MCP SDK and Streamable HTTP. Local demo only; no OAuth or real account binding yet.
+A nonproduction Go MCP gateway: config-driven downstream discovery, per-user tool catalogs, explicit authorization, and isolated synthetic credentials. Uses the official MCP SDK and Streamable HTTP. Synthetic preview only, with optional local persistence, own-binding controls and allowlisted HTTPS downstreams. No OAuth or real accounts.
 
 ## 当前架构
 
-当前是单个 Go 网关进程，使用官方 MCP SDK 与 Streamable HTTP。下图只展示已实现部分；入口和下游均限回环 HTTP，配置只使用虚构测试身份与凭证。已实现合成身份下的内存绑定与本地撤权；OAuth、安全网页绑定、凭证保险库与管理界面尚未实现。
+当前是单个 Go 网关进程，使用官方 MCP SDK 与 Streamable HTTP。下图只展示已实现部分；入口仍限回环 HTTP，默认下游也限回环 HTTP；可显式配置验证证书与 IP 允许列表的 HTTPS 下游。配置只使用虚构测试身份与凭证。已实现可选持久化、合成身份本地撤权及显式开启的本人绑定页面；OAuth、真实账号接入与生产密钥管理尚未实现。
 
 ```mermaid
 flowchart TB
@@ -55,7 +55,7 @@ sequenceDiagram
         G->>G: 校验整个系统目录，添加系统前缀，与白名单取交集
         Note over G,D: 某系统发现失败则该用户不发布该系统工具
     end
-    G->>S: 原子发布各用户目录，失败系统不保留旧目录
+    G->>S: 按用户和系统原子发布，失败系统不保留旧目录
 
     Note over C,D: 阶段二：入口就绪后处理客户端请求
     C->>G: tools/list + 入口 bearer token
@@ -93,6 +93,9 @@ sequenceDiagram
 - 分页、重复名称、恶意名称、异常 schema、下游不可用及目录大小都有边界处理。
 - 单个用户的某个系统发现失败时，该系统目录整体不发布；其他健康系统仍可使用。刷新失败不会保留旧目录。
 
+- 可选 [本人绑定页面](docs/account-preview.md)：有限期入口认证、本人绑定替换/撤销、定向刷新与过期拒绝，不授予工具权限。
+- 可选 [受控 HTTPS 与失败分类](docs/network-policy.md)：固定端点、IP 允许列表、TLS 验证和脱敏错误，不自动重试工具。
+
 ## 快速演示
 
 需要 Go 1.26 或更新版本（SQLite 驱动要求）。官方 SDK 固定为 v1.7.0，依赖校验在 go.sum 中。
@@ -119,12 +122,12 @@ go run ./cmd/gateway -config configs/demo.json -listen 127.0.0.1:8080
 这个命令只启动网关，不会自动启动任何下游。示例配置中的 9001、9002 是占位的本地 MCP 地址；需先自行运行对应模拟 MCP 服务，或替换为已运行的本地测试服务地址与虚构凭证。若地址不可用，网关会报告发现失败，并提供空的或部分可用的目录，不会假装连接成功。
 
 配置包括：
-- systems：唯一系统名、字面回环 HTTP 地址及可选下游认证头模式（默认 Bearer，另支持 raw Authorization 和 API-key header），见 [下游凭证请求头](docs/downstream-auth.md)。
+- systems：唯一系统名、默认字面回环 HTTP 地址（或显式受控 HTTPS 策略）及可选下游认证头模式（默认 Bearer，另支持 raw Authorization 和 API-key header），见 [下游凭证请求头](docs/downstream-auth.md)。
 - users：虚构身份、入口 token、完整工具名白名单，以及按系统索引的模拟下游 token。可选 tenant/principal 默认分别为 demo 与 users 对象键，不能重复配置同一身份组合。
 
 个人测试配置请复制为 `configs/dev.local.json`；除公开虚构示例 `configs/demo.json` 外，configs 下 JSON 配置默认忽略。不要在示例中填入真实凭证；gitignore 不是凭证保护或保险库。
 
-没有通配授权。配置中允许但下游未公布的工具不会出现，也不能调用。当前命令仅在启动时刷新目录；修改配置或下游工具后需重启。库中的 Refresh 可供测试及后续管理层调用，目前没有管理 API 或后台刷新任务。
+没有通配授权。配置中允许但下游未公布的工具不会出现，也不能调用。默认命令在启动时刷新目录；开启 -account 后，本人替换绑定会定向刷新该用户该系统。配置不可热改，没有公共管理 API 或后台刷新任务。
 
 ## 检查
 
@@ -141,9 +144,9 @@ CI 使用 go.mod 的 Go 版本执行格式、模块验证、测试、race、vet 
 
 产品范围、里程碑与反馈处理原则见 [路线图](docs/roadmap.md)。
 
-固定明文 token 只是演示身份，不是可信生产认证。仅允许回环 HTTP，拒绝所有浏览器 Origin、跨目标重定向、外部/动态 schema 引用及递归引用，不适用于部署公网服务。工具描述、注解与返回内容仍是不可信外部数据；不提供提示注入净化保证。
+固定明文 token 只是演示身份，不是可信生产认证。入口仅允许回环 HTTP；/mcp 拒绝浏览器 Origin，显式开启的 /account 只接受固定同源访问。下游可按允许列表启用 HTTPS。拒绝重定向、外部/动态 schema 引用及递归引用，不适用于部署公网服务。工具描述、注解与返回内容仍是不可信外部数据；不提供提示注入净化保证。
 
-尚未完成：OAuth/OIDC、安全网页账号绑定、生产凭证库与密钥轮换/备份恢复、管理界面、真实系统集成、多副本撤权、审计和限流、生产 TLS 与密钥轮换。不代理 resources、prompts、sampling、任务扩展或任意远程 MCP 地址。已支持[有界的同文档 schema 引用](docs/schema-references.md)，后续持续完善兼容性回归，并单独设计真实认证和生产凭证生命周期；当前不启用真实写操作。
+尚未完成：OAuth/OIDC、真实账号网页绑定、生产凭证库与密钥轮换/备份恢复、管理界面、真实系统集成、多副本撤权、审计和限流、公网入口 TLS 与密钥轮换。不代理 resources、prompts、sampling、任务扩展或任意远程 MCP 地址。已支持[有界的同文档 schema 引用](docs/schema-references.md)，后续持续完善兼容性回归，并单独设计真实认证和生产凭证生命周期；当前不启用真实写操作。
 
 ## 协议依据
 

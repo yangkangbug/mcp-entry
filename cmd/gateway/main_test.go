@@ -109,3 +109,19 @@ func TestKeyInputBoundedAndPrivate(t *testing.T) {
 		t.Fatal("directory accepted")
 	}
 }
+
+func TestAccountCommandPreflight(t *testing.T) {
+	for _, flag := range []string{"-account", "-account=false"} {
+		if _, err := parseOptions([]string{"-operation", "status", "-db", "state.sqlite", "-key-stdin", "-tenant", "demo", "-principal", "alice", flag}, io.Discard); err == nil {
+			t.Fatal("account flag accepted offline")
+		}
+	}
+	path := filepath.Join(t.TempDir(), "not-created.sqlite")
+	err := run([]string{"-config", "../../configs/demo.json", "-account", "-db", path, "-key-stdin", "-init-db"}, strings.NewReader("0123456789abcdef0123456789abcdef"), io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("weak demo auth enabled account mode")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("invalid account auth created store", err)
+	}
+}

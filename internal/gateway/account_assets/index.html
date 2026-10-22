@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect your accounts · MCP Entry</title><link rel="stylesheet" href="/account/assets/account.css"><script src="/account/assets/account.js" defer></script></head>
+<body><main>
+<p class="label">MCP ENTRY · LOCAL TEST</p><h1>Your connected accounts</h1>
+<p>Use this page for first connection or recovery. Normal MCP use does not require keeping it open. This local prototype is for synthetic credentials only.</p>
+<section><h2>1. Authenticate</h2><p>Enter your preprovisioned entry credential. It stays in this page's memory only. Closing or disconnecting the page clears it.</p>
+<form id="login-form"><label for="entry">Entry credential</label><input id="entry" type="password" autocomplete="off" spellcheck="false" required maxlength="4096"><button type="submit">Connect</button><button type="button" id="disconnect">Disconnect</button></form></section>
+<section><h2>2. Manage your binding</h2><p id="identity"></p><button type="button" id="refresh" disabled>Refresh status</button><ul id="bindings"></ul>
+<form id="binding-form"><label for="system">System</label><select id="system" disabled required></select><label for="credential">Replacement downstream credential</label><input id="credential" type="password" autocomplete="off" spellcheck="false" maxlength="4096" required disabled><label for="expiry">Expires at (your local time, optional)</label><input id="expiry" type="datetime-local" disabled><p>Acquire a replacement from the downstream provider separately. This page does not issue or automatically refresh provider grants.</p><button type="submit" id="replace" disabled>Save replacement</button><button type="button" id="revoke" disabled>Revoke selected binding</button></form></section>
+<p id="message" role="status" aria-live="polite">Not connected.</p>
+</main></body></html>

@@ -26,7 +26,7 @@ func (t *toolFlags) Set(value string) error { *t = append(*t, value); return nil
 
 type options struct {
 	config, listen, db, keyFile, operation, tenant, principal, system string
-	keyStdin, initialize                                              bool
+	keyStdin, initialize, account                                     bool
 	expected                                                          uint64
 	allowed                                                           toolFlags
 }
@@ -42,6 +42,7 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 	fs.StringVar(&o.db, "db", "", "optional local SQLite path; existing file required unless -init-db")
 	fs.StringVar(&o.keyFile, "key-file", "", "private regular file containing exactly 32 raw synthetic key bytes")
 	fs.BoolVar(&o.keyStdin, "key-stdin", false, "read exactly 32 raw synthetic key bytes followed by EOF from stdin")
+	fs.BoolVar(&o.account, "account", false, "serve only: enable local own-binding page; requires strong finite entry credentials")
 	fs.BoolVar(&o.initialize, "init-db", false, "serve only: explicitly initialize a nonexistent database")
 	fs.StringVar(&o.operation, "operation", "serve", "serve, status, revoke-binding, disable-principal, or set-policy")
 	fs.StringVar(&o.tenant, "tenant", "", "offline only: configured synthetic tenant")
@@ -85,7 +86,7 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 		}
 		return o, nil
 	}
-	if seen["listen"] || seen["init-db"] || o.db == "" || o.tenant == "" || o.principal == "" {
+	if seen["listen"] || seen["init-db"] || seen["account"] || o.db == "" || o.tenant == "" || o.principal == "" {
 		return o, errOptions
 	}
 	switch o.operation {
@@ -203,6 +204,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if o.account {
+		preview, err := gateway.New(cfg)
+		if err != nil {
+			return err
+		}
+		_, err = preview.AccountHandler("http://127.0.0.1:1")
+		preview.Close()
+		if err != nil {
+			return err
+		}
+	}
 	key, err := readKey(o, stdin)
 	if err != nil {
 		return err
@@ -242,7 +254,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", g.Handler())
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	if o.account {
+		account, err := g.AccountHandler("http://" + listener.Addr().String())
+		if err != nil {
+			return err
+		}
+		mux.Handle("/account", account)
+		mux.Handle("/account/", account)
+	}
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	logger.Printf("NONPRODUCTION SYNTHETIC GATEWAY: http://%s/mcp; %d discovery issue(s); no downstreams started", listener.Addr(), len(issues))

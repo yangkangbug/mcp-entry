@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var (
@@ -23,9 +24,11 @@ type Config struct {
 }
 
 type System struct {
-	Name     string     `json:"name"`
-	Endpoint string     `json:"endpoint"`
-	Auth     AuthConfig `json:"auth,omitempty"`
+	Name      string         `json:"name"`
+	Endpoint  string         `json:"endpoint"`
+	Auth      AuthConfig     `json:"auth,omitempty"`
+	Network   *NetworkPolicy `json:"network,omitempty"`
+	transport http.RoundTripper
 }
 
 // AuthConfig selects a single administrator-configured credential header.
@@ -96,11 +99,12 @@ func validCredential(value string, auth AuthConfig) bool {
 }
 
 type User struct {
-	Tenant      string            `json:"tenant,omitempty"`
-	Principal   string            `json:"principal,omitempty"`
-	Token       string            `json:"token"`
-	Allowed     []string          `json:"allowed"`
-	Credentials map[string]string `json:"credentials"`
+	TokenExpiresAt time.Time         `json:"token_expires_at,omitempty"`
+	Tenant         string            `json:"tenant,omitempty"`
+	Principal      string            `json:"principal,omitempty"`
+	Token          string            `json:"token"`
+	Allowed        []string          `json:"allowed"`
+	Credentials    map[string]string `json:"credentials"`
 }
 
 // LoadConfig rejects unknown fields, trailing documents and oversized configuration.

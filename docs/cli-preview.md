@@ -1,6 +1,6 @@
 # 本地可运行预览
 
-仅使用仓库内的合成用户与虚构凭据。需要 Go 1.26+；所有地址仍限字面回环 IP，没有公共管理 API。请从仓库根目录运行。
+仅使用仓库内的合成用户与虚构凭据。需要 Go 1.26+；入口和本页示例地址限字面回环 IP，没有公共管理 API。可选受控 HTTPS 下游见 [网络策略](network-policy.md)。请从仓库根目录运行。
 
 ## 1. 构建并显式启动模拟下游
 
@@ -99,3 +99,7 @@ mcp-inspector --cli --config configs/private/client.json --server gateway \
 ```
 
 测试使用隔离的 HOME、XDG_CONFIG_HOME 和 MCP_CLIENT_CONFIG_DIR，不读取真实账号或自动发起 OAuth。Inspector 的隐藏工具拒绝发生在客户端工具发现预检查；服务端直接调用越权由 SDK 回归独立验证。
+
+## 可选本人绑定页面
+
+`-account` 默认关闭，仅用于 serve；即使显式传入 false，也不能与离线操作组合。它要求预配置的 32 字节 base64url 格式入口 token 与有限有效期，原 demo-alice/demo-bob 不满足要求。准备合成配置、绑定替换、定向刷新和重启验证见 [本人绑定预览](account-preview.md)。页面 Origin 自动取实际回环监听地址，没有任意 Origin 开关。

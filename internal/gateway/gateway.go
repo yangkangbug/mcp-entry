@@ -3,7 +3,7 @@ package gateway
 
 import (
 	"context"
-	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -39,25 +39,28 @@ type snapshot struct {
 	handlers map[string]http.Handler
 }
 type Gateway struct {
-	closed        bool
-	store         *sqliteStore
-	entryTokens   map[string][32]byte
-	mu            sync.Mutex
-	principals    map[string]*principalState
-	identities    map[Identity]string
-	operations    map[uint64]admittedOperation
-	nextOperation uint64
-	systems       map[string]System
-	users         map[string]User
-	refreshMu     sync.Mutex
-	state         atomic.Pointer[snapshot]
+	closed         bool
+	store          *sqliteStore
+	entryTokens    map[string][32]byte
+	entryStrong    map[string]bool
+	discoveryEpoch map[discoveryKey]uint64
+	mu             sync.Mutex
+	principals     map[string]*principalState
+	identities     map[Identity]string
+	operations     map[uint64]admittedOperation
+	nextOperation  uint64
+	systems        map[string]System
+	users          map[string]User
+	refreshMu      sync.Mutex
+	state          atomic.Pointer[snapshot]
 }
 
 // DiscoveryIssue contains no credentials, raw downstream errors or tool descriptions.
 type DiscoveryIssue struct {
-	User   string
-	System string
-	Reason string
+	User    string
+	System  string
+	Reason  string
+	Failure *DownstreamFailure `json:"failure,omitempty"`
 }
 
 // New copies configuration. Nothing is published until Refresh discovers authorized tools.
@@ -67,7 +70,7 @@ func New(cfg Config) (*Gateway, error) {
 	}
 	g := &Gateway{systems: map[string]System{}, users: map[string]User{}}
 	for _, system := range cfg.Systems {
-		if !validPart(system.Name) || len(system.Name) > 64 || !validateEndpoint(system.Endpoint) {
+		if !validPart(system.Name) || len(system.Name) > 64 {
 			return nil, errors.New("invalid system name or non-loopback endpoint")
 		}
 		if _, exists := g.systems[system.Name]; exists {
@@ -78,15 +81,28 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, err
 		}
 		system.Auth = auth
+		if system.Network != nil {
+			copy := *system.Network
+			copy.AllowedIPs = append([]string(nil), copy.AllowedIPs...)
+			system.Network = &copy
+		}
+		transport, err := compileNetworkPolicy(system.Endpoint, system.Network)
+		if err != nil {
+			return nil, err
+		}
+		system.transport = transport
 		g.systems[system.Name] = system
 	}
 	tokens := map[string]bool{}
 	for id, user := range cfg.Users {
+		if !validExpiryDate(user.TokenExpiresAt.UTC()) {
+			return nil, errors.New("invalid entry credential expiry")
+		}
 		if id == "" || len(id) > 128 || user.Token == "" || len(user.Token) > 4096 || strings.ContainsAny(user.Token, "\r\n") || tokens[user.Token] {
 			return nil, errors.New("invalid demo identity")
 		}
 		tokens[user.Token] = true
-		clone := User{Tenant: user.Tenant, Principal: user.Principal, Token: user.Token, Allowed: append([]string(nil), user.Allowed...), Credentials: map[string]string{}}
+		clone := User{TokenExpiresAt: user.TokenExpiresAt.UTC(), Tenant: user.Tenant, Principal: user.Principal, Token: user.Token, Allowed: append([]string(nil), user.Allowed...), Credentials: map[string]string{}}
 		if len(clone.Allowed) > 2048 {
 			return nil, errors.New("too many policy tools")
 		}
@@ -107,8 +123,12 @@ func New(cfg Config) (*Gateway, error) {
 		return nil, err
 	}
 	g.entryTokens = map[string][32]byte{}
+	g.entryStrong = map[string]bool{}
+	g.discoveryEpoch = map[discoveryKey]uint64{}
 	for id, user := range g.users {
 		g.entryTokens[id] = entryTokenDigest(user.Token)
+		decoded, err := base64.RawURLEncoding.Strict().DecodeString(user.Token)
+		g.entryStrong[id] = err == nil && len(decoded) == 32
 		user.Token = ""
 		g.users[id] = user
 	}
@@ -134,8 +154,6 @@ func (g *Gateway) Names(id string) []string {
 func (g *Gateway) Refresh(ctx context.Context) []DiscoveryIssue {
 	g.refreshMu.Lock()
 	defer g.refreshMu.Unlock()
-	catalogs := map[string]map[string]entry{}
-	issues := []DiscoveryIssue{}
 	ids := make([]string, 0, len(g.users))
 	for id := range g.users {
 		ids = append(ids, id)
@@ -146,68 +164,13 @@ func (g *Gateway) Refresh(ctx context.Context) []DiscoveryIssue {
 		systems = append(systems, name)
 	}
 	sort.Strings(systems)
+	issues := []DiscoveryIssue{}
 	for _, id := range ids {
-		catalogs[id] = map[string]entry{}
-		for _, name := range systems {
-			g.mu.Lock()
-			p := g.principals[id]
-			if g.closed {
-				g.mu.Unlock()
-				issues = append(issues, DiscoveryIssue{id, name, "gateway closed"})
-				continue
-			}
-			needed := false
-			if !p.disabled {
-				for _, allowed := range p.allowed {
-					if strings.HasPrefix(allowed, name+"__") {
-						needed = true
-						break
-					}
-				}
-			}
-			if !needed {
-				g.mu.Unlock()
-				continue
-			}
-			b := p.bindings[name]
-			if b.info.State != BindingActive || b.credential == "" {
-				g.mu.Unlock()
-				issues = append(issues, DiscoveryIssue{id, name, "credential unavailable"})
-				continue
-			}
-			generation, version, token := b.info.Generation, p.version, b.credential
-			opCtx, cancel := context.WithCancel(ctx)
-			g.nextOperation++
-			opID := g.nextOperation
-			g.operations[opID] = admittedOperation{id, name, cancel}
-			g.mu.Unlock()
-			entries, err := g.discover(opCtx, g.systems[name], token)
-			g.mu.Lock()
-			delete(g.operations, opID)
-			cancel()
-			if err != nil {
-				issues = append(issues, DiscoveryIssue{id, name, "discovery failed; system catalog unavailable"})
-			} else {
-				for tool, e := range entries {
-					e.generation, e.policyVersion = generation, version
-					if g.entryAllowedLocked(id, tool, e) {
-						catalogs[id][tool] = e
-					}
-				}
-			}
-			g.mu.Unlock()
+		user := g.users[id]
+		for _, system := range systems {
+			issues = append(issues, g.RefreshBinding(ctx, Identity{user.Tenant, user.Principal}, system)...)
 		}
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	for id, cat := range catalogs {
-		for name, e := range cat {
-			if !g.entryAllowedLocked(id, name, e) {
-				delete(cat, name)
-			}
-		}
-	}
-	g.state.Store(g.makeSnapshot(catalogs))
 	return issues
 }
 
@@ -259,19 +222,29 @@ func connect(ctx context.Context, system System, token string) (*mcp.ClientSessi
 		}
 	})
 
-	return client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: system.Endpoint, HTTPClient: systemOperationClient(ctx, token, system.Auth), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+	return client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: system.Endpoint, HTTPClient: downstreamOperationClient(ctx, token, system), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
 }
 
-func (g *Gateway) discover(ctx context.Context, system System, token string) (map[string]entry, error) {
+func (g *Gateway) discover(ctx context.Context, system System, token string) (resultEntries map[string]entry, retErr error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	ctx, observation := withFailureObservation(ctx)
+	observation.setPhase(FailureConnect)
 	session, err := connect(ctx, system, token)
 	if err != nil {
-		return nil, err
+		return nil, classifyDownstreamFailure(ctx, FailureConnect, err, false)
 	}
 	// Cleanup is synchronous and shares ctx. A cleanup error must not replace a
 	// complete discovery result or a confirmed tool outcome.
-	defer session.Close()
+	defer func() { observation.setPhase(FailureCleanup); session.Close() }()
+	defer func() {
+		if retErr != nil {
+			var typed *DownstreamFailure
+			if !errors.As(retErr, &typed) {
+				retErr = classifyDownstreamFailure(ctx, FailureDiscovery, retErr, false)
+			}
+		}
+	}()
 	entries := map[string]entry{}
 	seen := map[string]bool{}
 	cursor := ""
@@ -281,9 +254,10 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (ma
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		observation.setPhase(FailureDiscovery)
 		result, err := session.ListTools(ctx, &mcp.ListToolsParams{Cursor: cursor})
 		if err != nil {
-			return nil, err
+			return nil, classifyDownstreamFailure(ctx, FailureDiscovery, err, false)
 		}
 		total += len(result.Tools)
 		if total > MaxToolsPerSystem {
@@ -526,16 +500,19 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.Cal
 	g.operations[opID] = admittedOperation{id, e.system.Name, cancel}
 	g.mu.Unlock()
 	defer func() { g.mu.Lock(); delete(g.operations, opID); g.mu.Unlock() }()
+	ctx, observation := withFailureObservation(ctx)
+	observation.setPhase(FailureConnect)
 	session, err := connect(ctx, e.system, token)
 	if err != nil {
-		return nil, errors.New("downstream unavailable")
+		return nil, classifyDownstreamFailure(ctx, FailureConnect, err, false)
 	}
 	// Cleanup is synchronous and shares ctx. A cleanup error must not replace a
 	// complete discovery result or a confirmed tool outcome.
-	defer session.Close()
+	defer func() { observation.setPhase(FailureCleanup); session.Close() }()
+	observation.setPhase(FailureCall)
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: e.original, Arguments: json.RawMessage(data)})
 	if err != nil {
-		return nil, errors.New("downstream call failed; outcome may be unknown; not retried")
+		return nil, classifyDownstreamFailure(ctx, FailureCall, err, true)
 	}
 	return result, nil
 }
@@ -597,17 +574,16 @@ func (g *Gateway) Handler() http.Handler {
 			http.Error(w, "browser access disabled", http.StatusForbidden)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		digest := entryTokenDigest(strings.TrimPrefix(auth, "Bearer "))
-		for id, expected := range g.entryTokens {
-			if strings.HasPrefix(auth, "Bearer ") && subtle.ConstantTimeCompare(digest[:], expected[:]) == 1 {
-				g.mu.Lock()
-				active := !g.closed && !g.principals[id].disabled
-				handler := g.state.Load().handlers[id]
-				g.mu.Unlock()
-				if !active {
-					break
-				}
+		identity, ok := g.authenticateEntry(r)
+		if ok {
+			g.mu.Lock()
+			id, p, err := g.principalLocked(identity)
+			var handler http.Handler
+			if err == nil && !p.disabled && g.principalUsableLocked(id) {
+				handler = g.state.Load().handlers[id]
+			}
+			g.mu.Unlock()
+			if handler != nil {
 				handler.ServeHTTP(w, r)
 				return
 			}
@@ -688,6 +664,22 @@ func (b *operationBody) Close() error {
 	b.once.Do(b.release)
 	return b.ReadCloser.Close()
 }
+
+func downstreamOperationClient(ctx context.Context, token string, system System) *http.Client {
+	base := system.transport
+	if base == nil {
+		var err error
+		base, err = compileNetworkPolicy(system.Endpoint, system.Network)
+		if err != nil {
+			return &http.Client{Transport: deniedTransport{}}
+		}
+	}
+	return &http.Client{Transport: observeFailureTransport(ctx, credentialTransport{auth: system.Auth, token: token, base: base, operation: ctx}), Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
+}
+
+type deniedTransport struct{}
+
+func (deniedTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, errNetworkPolicy }
 
 func systemOperationClient(ctx context.Context, token string, auth AuthConfig) *http.Client {
 	return &http.Client{Transport: credentialTransport{auth: auth, token: token, base: http.DefaultTransport, operation: ctx}, Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}

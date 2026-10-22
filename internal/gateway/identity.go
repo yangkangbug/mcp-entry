@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 var ErrConflict = errors.New("state version conflict")
@@ -28,6 +29,7 @@ type BindingInfo struct {
 	Principal  string
 	System     string
 	Generation uint64
+	ExpiresAt  time.Time `json:",omitzero"`
 	State      BindingState
 }
 type PolicyInfo struct {
@@ -124,6 +126,15 @@ func (g *Gateway) Binding(identity Identity, system string) (BindingInfo, error)
 	return b.info, nil
 }
 func (g *Gateway) ReplaceBinding(identity Identity, system string, expected uint64, credential string) (BindingInfo, error) {
+	return g.ReplaceBindingExpiring(identity, system, expected, credential, time.Time{})
+}
+func (g *Gateway) ReplaceBindingExpiring(identity Identity, system string, expected uint64, credential string, expiresAt time.Time) (BindingInfo, error) {
+	return g.replaceBinding(identity, system, expected, credential, expiresAt, false)
+}
+func (g *Gateway) replaceOwnBinding(identity Identity, system string, expected uint64, credential string, expiresAt time.Time) (BindingInfo, error) {
+	return g.replaceBinding(identity, system, expected, credential, expiresAt, true)
+}
+func (g *Gateway) replaceBinding(identity Identity, system string, expected uint64, credential string, expiresAt time.Time, own bool) (BindingInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	id, p, err := g.principalLocked(identity)
@@ -131,19 +142,20 @@ func (g *Gateway) ReplaceBinding(identity Identity, system string, expected uint
 		return BindingInfo{}, err
 	}
 	b, ok := p.bindings[system]
-	if !ok || p.disabled {
+	if !ok || p.disabled || (own && !g.principalUsableLocked(id)) {
 		return BindingInfo{}, ErrDenied
 	}
 	if b.info.Generation != expected {
 		return BindingInfo{}, ErrConflict
 	}
-	if credential == "" || !validCredential(credential, g.systems[system].Auth) {
+	if credential == "" || !validCredential(credential, g.systems[system].Auth) || !validExpiryDate(expiresAt.UTC()) || (!expiresAt.IsZero() && !time.Now().Before(expiresAt)) {
 		return BindingInfo{}, errors.New("invalid binding credential")
 	}
 	p = clonePrincipal(p)
 	b = p.bindings[system]
 	b.info.Generation++
 	b.info.State = BindingActive
+	b.info.ExpiresAt = expiresAt.UTC()
 	b.credential = credential
 	if err := g.publishPrincipalLocked(id, p, system); err != nil {
 		return BindingInfo{}, err
@@ -151,6 +163,12 @@ func (g *Gateway) ReplaceBinding(identity Identity, system string, expected uint
 	return b.info, nil
 }
 func (g *Gateway) RevokeBinding(identity Identity, system string, expected uint64) (BindingInfo, error) {
+	return g.revokeBinding(identity, system, expected, false)
+}
+func (g *Gateway) revokeOwnBinding(identity Identity, system string, expected uint64) (BindingInfo, error) {
+	return g.revokeBinding(identity, system, expected, true)
+}
+func (g *Gateway) revokeBinding(identity Identity, system string, expected uint64, own bool) (BindingInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	id, p, err := g.principalLocked(identity)
@@ -158,7 +176,7 @@ func (g *Gateway) RevokeBinding(identity Identity, system string, expected uint6
 		return BindingInfo{}, err
 	}
 	b, ok := p.bindings[system]
-	if !ok {
+	if !ok || (own && !g.principalUsableLocked(id)) {
 		return BindingInfo{}, ErrDenied
 	}
 	if b.info.Generation != expected {
@@ -235,7 +253,7 @@ func (g *Gateway) cancelOperationsLocked(id, system string) {
 }
 func (g *Gateway) allowedLocked(id, name string) bool {
 	p := g.principals[id]
-	if g.closed || p == nil || p.disabled {
+	if p == nil || !g.principalUsableLocked(id) {
 		return false
 	}
 	for _, n := range p.allowed {
@@ -251,7 +269,7 @@ func (g *Gateway) entryAllowedLocked(id, name string, e entry) bool {
 	}
 	p := g.principals[id]
 	b := p.bindings[e.system.Name]
-	return b != nil && b.info.State == BindingActive && b.credential != "" && b.info.Generation == e.generation && p.version == e.policyVersion
+	return b != nil && bindingUsable(b) && b.info.Generation == e.generation && p.version == e.policyVersion
 }
 func (g *Gateway) evaluateLocked(id, name string) (entry, bool) {
 	e, exists := g.state.Load().catalogs[id][name]
