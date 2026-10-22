@@ -86,6 +86,9 @@ func (g *Gateway) initializeIdentities() error {
 	return nil
 }
 func (g *Gateway) principalLocked(identity Identity) (string, *principalState, error) {
+	if g.closed {
+		return "", nil, ErrClosed
+	}
 	id, ok := g.identities[identity]
 	if !ok {
 		return "", nil, ErrDenied
@@ -137,11 +140,14 @@ func (g *Gateway) ReplaceBinding(identity Identity, system string, expected uint
 	if credential == "" || !validCredential(credential, g.systems[system].Auth) {
 		return BindingInfo{}, errors.New("invalid binding credential")
 	}
+	p = clonePrincipal(p)
+	b = p.bindings[system]
 	b.info.Generation++
 	b.info.State = BindingActive
 	b.credential = credential
-	g.invalidateLocked(id, system)
-	g.cancelOperationsLocked(id, system)
+	if err := g.publishPrincipalLocked(id, p, system); err != nil {
+		return BindingInfo{}, err
+	}
 	return b.info, nil
 }
 func (g *Gateway) RevokeBinding(identity Identity, system string, expected uint64) (BindingInfo, error) {
@@ -158,18 +164,24 @@ func (g *Gateway) RevokeBinding(identity Identity, system string, expected uint6
 	if b.info.Generation != expected {
 		return BindingInfo{}, ErrConflict
 	}
+	p = clonePrincipal(p)
+	b = p.bindings[system]
 	b.info.Generation++
 	b.info.State = BindingRevoked
 	b.credential = ""
-	g.invalidateLocked(id, system)
-	g.cancelOperationsLocked(id, system)
+	if err := g.publishPrincipalLocked(id, p, system); err != nil {
+		return BindingInfo{}, err
+	}
 	return b.info, nil
 }
 func (g *Gateway) SetPolicy(identity Identity, expected uint64, allowed []string) (PolicyInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	id, p, err := g.principalLocked(identity)
-	if err != nil || p.disabled {
+	if err != nil {
+		return PolicyInfo{}, err
+	}
+	if p.disabled {
 		return PolicyInfo{}, ErrDenied
 	}
 	if p.version != expected {
@@ -183,10 +195,12 @@ func (g *Gateway) SetPolicy(identity Identity, expected uint64, allowed []string
 			return PolicyInfo{}, errors.New("invalid policy tool")
 		}
 	}
+	p = clonePrincipal(p)
 	p.version++
 	p.allowed = append([]string(nil), allowed...)
-	g.invalidateLocked(id, "")
-	g.cancelOperationsLocked(id, "")
+	if err := g.publishPrincipalLocked(id, p, ""); err != nil {
+		return PolicyInfo{}, err
+	}
 	return policyInfo(p), nil
 }
 func (g *Gateway) DisablePrincipal(identity Identity, expected uint64) (PolicyInfo, error) {
@@ -199,6 +213,7 @@ func (g *Gateway) DisablePrincipal(identity Identity, expected uint64) (PolicyIn
 	if p.version != expected {
 		return PolicyInfo{}, ErrConflict
 	}
+	p = clonePrincipal(p)
 	p.version++
 	p.disabled = true
 	for _, b := range p.bindings {
@@ -206,8 +221,9 @@ func (g *Gateway) DisablePrincipal(identity Identity, expected uint64) (PolicyIn
 		b.info.State = BindingRevoked
 		b.credential = ""
 	}
-	g.invalidateLocked(id, "")
-	g.cancelOperationsLocked(id, "")
+	if err := g.publishPrincipalLocked(id, p, ""); err != nil {
+		return PolicyInfo{}, err
+	}
 	return policyInfo(p), nil
 }
 func (g *Gateway) cancelOperationsLocked(id, system string) {
@@ -219,7 +235,7 @@ func (g *Gateway) cancelOperationsLocked(id, system string) {
 }
 func (g *Gateway) allowedLocked(id, name string) bool {
 	p := g.principals[id]
-	if p == nil || p.disabled {
+	if g.closed || p == nil || p.disabled {
 		return false
 	}
 	for _, n := range p.allowed {

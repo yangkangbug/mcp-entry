@@ -5,6 +5,7 @@
 - cmd/demo：显式启动两个虚构 MCP 下游并运行发现演示。
 - cmd/gateway：读取配置，只启动入口；不启动任何下游。
 - internal/gateway/config.go：受限 JSON 配置与连接/身份/策略校验。
+- internal/gateway/persistence.go：可选 SQLite 单实例存储、凭据加密、状态完整性与失败关闭。
 - internal/gateway/identity.go：合成身份、内存绑定与策略版本、受信进程内变更和本地撤权。
 - internal/gateway/gateway.go：发现、按用户的目录快照、授权、schema 校验与代理。
 - internal/mock：仅用于演示及测试的 MCP 服务。
@@ -60,3 +61,7 @@ Refresh 按确定顺序执行，并原子替换整个目录。失败系统不保
 ## 下游认证头
 
 系统配置选择 Bearer（默认）、raw Authorization 或受限的 API-key header，凭证仍严格按用户与系统选择。协议/路由/代理/Cookie/session/转发身份等已知保留头不可配置为 API-key header；参数与 schema 不参与认证头选择。发现、调用和清理使用同一选择，重定向仍拒绝。此适配不引入新的入口身份或凭证持久化机制，细则与虚构配置见 [下游凭证请求头](downstream-auth.md)。
+
+## 可选持久化
+
+NewPersistent 为库级显式选择，默认命令仍使用 New 的内存模式。候选授权状态提交到 SQLite 后才发布；写失败关闭准入，重开不重新导入旧策略或凭据。入口只存验证摘要，下游凭据使用独立外部密钥派生的 AEAD 加密，元数据仍可读。单实例所有权、关闭、初始化和旧备份风险见 [存储说明](persistence.md)。

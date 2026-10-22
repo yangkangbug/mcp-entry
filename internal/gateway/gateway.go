@@ -3,6 +3,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -38,6 +39,9 @@ type snapshot struct {
 	handlers map[string]http.Handler
 }
 type Gateway struct {
+	closed        bool
+	store         *sqliteStore
+	entryTokens   map[string][32]byte
 	mu            sync.Mutex
 	principals    map[string]*principalState
 	identities    map[Identity]string
@@ -102,6 +106,12 @@ func New(cfg Config) (*Gateway, error) {
 	if err := g.initializeIdentities(); err != nil {
 		return nil, err
 	}
+	g.entryTokens = map[string][32]byte{}
+	for id, user := range g.users {
+		g.entryTokens[id] = entryTokenDigest(user.Token)
+		user.Token = ""
+		g.users[id] = user
+	}
 	g.state.Store(g.makeSnapshot(map[string]map[string]entry{}))
 	return g, nil
 }
@@ -141,6 +151,11 @@ func (g *Gateway) Refresh(ctx context.Context) []DiscoveryIssue {
 		for _, name := range systems {
 			g.mu.Lock()
 			p := g.principals[id]
+			if g.closed {
+				g.mu.Unlock()
+				issues = append(issues, DiscoveryIssue{id, name, "gateway closed"})
+				continue
+			}
 			needed := false
 			if !p.disabled {
 				for _, allowed := range p.allowed {
@@ -583,10 +598,11 @@ func (g *Gateway) Handler() http.Handler {
 			return
 		}
 		auth := r.Header.Get("Authorization")
-		for id, user := range g.users {
-			if auth == "Bearer "+user.Token {
+		digest := entryTokenDigest(strings.TrimPrefix(auth, "Bearer "))
+		for id, expected := range g.entryTokens {
+			if strings.HasPrefix(auth, "Bearer ") && subtle.ConstantTimeCompare(digest[:], expected[:]) == 1 {
 				g.mu.Lock()
-				active := !g.principals[id].disabled
+				active := !g.closed && !g.principals[id].disabled
 				handler := g.state.Load().handlers[id]
 				g.mu.Unlock()
 				if !active {
