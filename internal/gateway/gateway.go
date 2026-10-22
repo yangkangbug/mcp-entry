@@ -210,10 +210,82 @@ func (g *Gateway) Refresh(ctx context.Context) []DiscoveryIssue {
 	return issues
 }
 
-func connect(ctx context.Context, system System, token string) (*mcp.ClientSession, error) {
+// catalogAdmission accounts for the entire received catalog before the SDK can
+// filter tools or inspect header annotations. Its authorization view is immutable
+// and belongs to one discovery attempt, never to the session's later policy.
+type catalogAdmission struct {
+	system  string
+	allowed map[string]bool
+	names   map[string]bool
+	cursors map[string]bool
+	total   int
+	bytes   int
+	pages   int
+}
+
+func (a *catalogAdmission) admit(ctx context.Context, list *mcp.ListToolsResult) error {
+	if list == nil || list.Tools == nil {
+		return errors.New("invalid catalog")
+	}
+	a.pages++
+	a.total += len(list.Tools)
+	if a.pages > MaxPagesPerSystem || a.total > MaxToolsPerSystem {
+		return errors.New("catalog count limit")
+	}
+	if len(list.NextCursor) > 4096 || (list.NextCursor != "" && a.cursors[list.NextCursor]) {
+		return errors.New("invalid pagination cursor")
+	}
+	if list.NextCursor != "" {
+		a.cursors[list.NextCursor] = true
+	}
+	selected := make([]*mcp.Tool, 0, len(list.Tools))
+	for _, tool := range list.Tools {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if tool == nil || !validPart(tool.Name) || !toolNamePattern.MatchString(a.system+"__"+tool.Name) {
+			return errors.New("invalid downstream tool name")
+		}
+		name := a.system + "__" + tool.Name
+		if a.names[name] {
+			return errors.New("duplicate downstream tool")
+		}
+		a.names[name] = true
+		data, err := json.Marshal(tool)
+		a.bytes += len(data)
+		if err != nil || len(data) > 64<<10 || a.bytes > 1<<20 {
+			return errors.New("catalog byte limit")
+		}
+		schemas := []any{tool.InputSchema}
+		if tool.OutputSchema != nil {
+			schemas = append(schemas, tool.OutputSchema)
+		}
+		for _, schema := range schemas {
+			if err := validateSchemaStructure(schema); err != nil {
+				return observeSchemaAdmission(ctx, err)
+			}
+		}
+		if !a.allowed[name] {
+			continue
+		}
+		// Fail selected tools before SDK filterValidTools can silently drop them or
+		// log schema-derived errors. Compilation still occurs atomically in discover.
+		for _, schema := range schemas {
+			if _, err := analyzeSchema(schema); err != nil {
+				return observeSchemaAdmission(ctx, err)
+			}
+			if err := validateSchemaTypes(schema); err != nil {
+				return observeSchemaAdmission(ctx, err)
+			}
+		}
+		selected = append(selected, tool)
+	}
+	list.Tools = selected
+	return nil
+}
+
+func connect(ctx context.Context, system System, token string, admission *catalogAdmission) (*mcp.ClientSession, error) {
 	client := mcp.NewClient(&mcp.Implementation{Name: "mcp-entry", Version: "0.2.0-demo"}, &mcp.ClientOptions{MultiRoundTrip: &mcp.MultiRoundTripOptions{Disabled: true}})
-	// Validate before SDK ListTools filters malformed header annotations or dereferences
-	// nil entries. A malformed catalog must fail as a whole, not become a partial list.
 	client.AddSendingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			result, err := next(ctx, method, req)
@@ -222,51 +294,26 @@ func connect(ctx context.Context, system System, token string) (*mcp.ClientSessi
 			}
 			if method == "tools/list" {
 				list, ok := result.(*mcp.ListToolsResult)
-				if !ok || list == nil {
-					return nil, errors.New("invalid catalog")
+				if !ok || admission == nil {
+					return nil, errors.New("unexpected catalog")
 				}
-				if len(list.Tools) > MaxToolsPerSystem {
-					return nil, errors.New("tool count limit")
-				}
-				pageBytes := 0
-				for _, tool := range list.Tools {
-					if tool == nil {
-						return nil, errors.New("null tool")
-					}
-					data, err := json.Marshal(tool)
-					pageBytes += len(data)
-					if err != nil || len(data) > 64<<10 || pageBytes > 1<<20 {
-						return nil, errors.New("catalog byte limit")
-					}
-				}
-				for _, tool := range list.Tools {
-					schemas := []any{tool.InputSchema}
-					if tool.OutputSchema != nil {
-						schemas = append(schemas, tool.OutputSchema)
-					}
-					for _, schema := range schemas {
-						if _, err := analyzeSchema(schema); err != nil {
-							return nil, observeSchemaAdmission(ctx, err)
-						}
-						if err := validateSchemaTypes(schema); err != nil {
-							return nil, observeSchemaAdmission(ctx, err)
-						}
-					}
+				if err := admission.admit(ctx, list); err != nil {
+					return nil, err
 				}
 			}
 			return result, nil
 		}
 	})
-
 	return client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: system.Endpoint, HTTPClient: downstreamOperationClient(ctx, token, system), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
 }
 
-func (g *Gateway) discover(ctx context.Context, system System, token string) (resultEntries map[string]entry, retErr error) {
+func (g *Gateway) discover(ctx context.Context, system System, token string, allowed map[string]bool) (resultEntries map[string]entry, retErr error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	ctx, observation := withFailureObservation(ctx)
 	observation.setPhase(FailureConnect)
-	session, err := connect(ctx, system, token)
+	admission := &catalogAdmission{system: system.Name, allowed: allowed, names: map[string]bool{}, cursors: map[string]bool{}}
+	session, err := connect(ctx, system, token, admission)
 	if err != nil {
 		return nil, classifyDownstreamFailure(ctx, FailureConnect, err, false)
 	}
@@ -282,10 +329,7 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (re
 		}
 	}()
 	entries := map[string]entry{}
-	seen := map[string]bool{}
 	cursor := ""
-	total := 0
-	totalBytes := 0
 	for page := 0; page < MaxPagesPerSystem; page++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -295,28 +339,14 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (re
 		if err != nil {
 			return nil, classifyDownstreamFailure(ctx, FailureDiscovery, err, false)
 		}
-		total += len(result.Tools)
-		if total > MaxToolsPerSystem {
-			return nil, errors.New("tool count limit")
-		}
 		for _, tool := range result.Tools {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			if tool == nil || !validPart(tool.Name) || !toolNamePattern.MatchString(system.Name+"__"+tool.Name) {
-				return nil, errors.New("invalid downstream tool name")
-			}
 			name := system.Name + "__" + tool.Name
-			if _, exists := entries[name]; exists {
-				return nil, errors.New("duplicate downstream tool")
-			}
 			data, err := json.Marshal(tool)
 			if err != nil {
 				return nil, err
-			}
-			totalBytes += len(data)
-			if len(data) > 64<<10 || totalBytes > 1<<20 {
-				return nil, errors.New("catalog byte limit")
 			}
 			var copy mcp.Tool
 			if err := json.Unmarshal(data, &copy); err != nil {
@@ -342,10 +372,6 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (re
 			}
 			return entries, nil
 		}
-		if len(result.NextCursor) > 4096 || seen[result.NextCursor] {
-			return nil, errors.New("invalid pagination cursor")
-		}
-		seen[result.NextCursor] = true
 		cursor = result.NextCursor
 	}
 	return nil, errors.New("pagination limit")
@@ -556,7 +582,7 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 	defer func() { g.finishOperation(opID, event, started, retErr, result != nil && result.IsError, permit) }()
 	ctx, observation := withFailureObservation(ctx)
 	observation.setPhase(FailureConnect)
-	session, err := connect(ctx, e.system, token)
+	session, err := connect(ctx, e.system, token, nil)
 	if err != nil {
 		return nil, classifyDownstreamFailure(ctx, FailureConnect, err, false)
 	}

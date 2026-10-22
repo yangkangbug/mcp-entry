@@ -431,13 +431,13 @@ func TestDynamicDiscoveryRejectsEntireMalformedCatalog(t *testing.T) {
 		t.Run("input_"+tc.name, func(t *testing.T) {
 			bad := discoveryCatalogTool("bad")
 			bad["inputSchema"] = tc.schema
-			assertRejectedDiscoveryCatalog(t, []any{discoveryCatalogTool("available"), bad})
+			assertRejectedDiscoveryCatalog(t, []any{discoveryCatalogTool("available"), bad}, "test__bad")
 		})
 	}
 	t.Run("invalid_output_schema", func(t *testing.T) {
 		bad := discoveryCatalogTool("bad")
 		bad["outputSchema"] = map[string]any{"type": "not-a-type"}
-		assertRejectedDiscoveryCatalog(t, []any{discoveryCatalogTool("available"), bad})
+		assertRejectedDiscoveryCatalog(t, []any{discoveryCatalogTool("available"), bad}, "test__bad")
 	})
 	t.Run("nil_tool", func(t *testing.T) {
 		assertRejectedDiscoveryCatalog(t, []any{discoveryCatalogTool("available"), nil})
@@ -469,7 +469,11 @@ func TestDynamicDiscoveryRejectsUnsafeSchemaReferences(t *testing.T) {
 				downstream, _ := discoveryCatalogServer(t, func(string, int) (any, int) {
 					return map[string]any{"tools": []any{discoveryCatalogTool("available"), bad}}, http.StatusOK
 				})
-				g, err := gateway.New(discoverySingleConfig(downstream.URL))
+				cfg := discoverySingleConfig(downstream.URL)
+				user := cfg.Users["alice"]
+				user.Allowed = append(user.Allowed, "test__bad")
+				cfg.Users["alice"] = user
+				g, err := gateway.New(cfg)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -546,12 +550,16 @@ func TestDynamicDiscoveryPreservesLiteralSchemaKeywordData(t *testing.T) {
 	}
 }
 
-func assertRejectedDiscoveryCatalog(t *testing.T, tools []any) {
+func assertRejectedDiscoveryCatalog(t *testing.T, tools []any, allowed ...string) {
 	t.Helper()
 	downstream, _ := discoveryCatalogServer(t, func(string, int) (any, int) {
 		return map[string]any{"tools": tools}, http.StatusOK
 	})
-	g, err := gateway.New(discoverySingleConfig(downstream.URL))
+	cfg := discoverySingleConfig(downstream.URL)
+	user := cfg.Users["alice"]
+	user.Allowed = append(user.Allowed, allowed...)
+	cfg.Users["alice"] = user
+	g, err := gateway.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -59,6 +59,24 @@ func TestSchemaAdmissionDiscoveryAtomicDiagnostics(t *testing.T) {
 					failed.Store(true)
 					before := requests.Load()
 					issues := g.Refresh(ctx)
+					if !authorized {
+						if len(issues) != 0 || !reflect.DeepEqual(g.Names("alice"), []string{"broken__available", "healthy__available"}) {
+							t.Fatalf("unauthorized schema poisoned authorized view: issues=%+v names=%v", issues, g.Names("alice"))
+						}
+						if requests.Load() != before+1 {
+							t.Fatal("discovery retried")
+						}
+						if _, err := g.Call(ctx, "alice", "broken__CANARY_unauthorized_tool", map[string]any{}); !errors.Is(err, gateway.ErrDenied) {
+							t.Fatal("unauthorized tool callable")
+						}
+						if result, err := g.Call(ctx, "alice", "broken__available", map[string]any{}); err != nil || result.IsError {
+							t.Fatal("authorized lookup unavailable")
+						}
+						if strings.Contains(logs.String(), "CANARY") {
+							t.Fatal("unauthorized schema leaked to SDK logs")
+						}
+						return
+					}
 					if len(issues) != 1 || issues[0].Failure == nil {
 						t.Fatalf("missing failure: %+v", issues)
 					}

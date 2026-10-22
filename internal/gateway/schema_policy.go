@@ -94,10 +94,24 @@ type schemaPolicyNode struct {
 }
 
 type schemaPolicyGraph struct {
+	structuralOnly   bool
 	index            map[string]*schemaPolicyNode
 	refs             int
 	hasID            bool
 	hasNestedDialect bool
+}
+
+// validateSchemaStructure bounds every received schema, even when not selected.
+// It checks raw JSON and schema-container shape without interpreting references,
+// compiling regexps, or accepting SDK header mappings. Unselected schemas never
+// reach either validator or SDK schema processing.
+func validateSchemaStructure(value any) error {
+	if _, err := countJSONBudget(value, MaxSchemaDepth, MaxSchemaRawNodes); err != nil {
+		return errors.New("schema raw JSON budget exceeded or invalid JSON shape")
+	}
+	graph := schemaPolicyGraph{index: make(map[string]*schemaPolicyNode), structuralOnly: true}
+	_, err := graph.add(value, "")
+	return err
 }
 
 // analyzeSchema checks a decoded JSON schema before the validator or SDK sees it.
@@ -143,43 +157,45 @@ func (g *schemaPolicyGraph) add(value any, path string) (*schemaPolicyNode, erro
 	if !ok || schema == nil {
 		return nil, errors.New("schema must be an object or boolean")
 	}
-	if err := rejectSchemaKeywordAliases(schema); err != nil {
-		return nil, err
-	}
-	if pattern, exists := schema["pattern"]; exists {
-		expression, ok := pattern.(string)
-		if !ok {
-			return nil, &schemaAdmissionError{reason: SchemaRegexpInvalidOrUnsupported}
-		}
-		if _, err := regexp.Compile(expression); err != nil {
-			return nil, &schemaAdmissionError{reason: SchemaRegexpInvalidOrUnsupported}
-		}
-	}
-	for _, key := range []string{"$dynamicRef", "x-mcp-header"} {
-		if _, exists := schema[key]; exists {
-			return nil, errors.New("dynamic schema references and header mappings unsupported")
-		}
-	}
-	if _, exists := schema["$id"]; exists {
-		g.hasID = true
-	}
-	if _, exists := schema["$schema"]; exists && path != "" {
-		g.hasNestedDialect = true
-	}
-	if ref, exists := schema["$ref"]; exists {
-		g.refs++
-		if g.refs > MaxSchemaRefs {
-			return nil, errors.New("schema reference limit exceeded")
-		}
-		text, ok := ref.(string)
-		if !ok {
-			return nil, errors.New("schema reference must be a string")
-		}
-		canonical, err := canonicalSchemaReference(text)
-		if err != nil {
+	if !g.structuralOnly {
+		if err := rejectSchemaKeywordAliases(schema); err != nil {
 			return nil, err
 		}
-		node.ref, node.hasRef = canonical, true
+		if pattern, exists := schema["pattern"]; exists {
+			expression, ok := pattern.(string)
+			if !ok {
+				return nil, &schemaAdmissionError{reason: SchemaRegexpInvalidOrUnsupported}
+			}
+			if _, err := regexp.Compile(expression); err != nil {
+				return nil, &schemaAdmissionError{reason: SchemaRegexpInvalidOrUnsupported}
+			}
+		}
+		for _, key := range []string{"$dynamicRef", "x-mcp-header"} {
+			if _, exists := schema[key]; exists {
+				return nil, errors.New("dynamic schema references and header mappings unsupported")
+			}
+		}
+		if _, exists := schema["$id"]; exists {
+			g.hasID = true
+		}
+		if _, exists := schema["$schema"]; exists && path != "" {
+			g.hasNestedDialect = true
+		}
+		if ref, exists := schema["$ref"]; exists {
+			g.refs++
+			if g.refs > MaxSchemaRefs {
+				return nil, errors.New("schema reference limit exceeded")
+			}
+			text, ok := ref.(string)
+			if !ok {
+				return nil, errors.New("schema reference must be a string")
+			}
+			canonical, err := canonicalSchemaReference(text)
+			if err != nil {
+				return nil, err
+			}
+			node.ref, node.hasRef = canonical, true
+		}
 	}
 	addChild := func(child any, childPath string) error {
 		n, err := g.add(child, childPath)
@@ -197,7 +213,7 @@ func (g *schemaPolicyGraph) add(value any, path string) (*schemaPolicyNode, erro
 				return nil, errors.New("schema map keyword must contain an object")
 			}
 			for name, value := range children {
-				if key == "patternProperties" {
+				if key == "patternProperties" && !g.structuralOnly {
 					if _, err := regexp.Compile(name); err != nil {
 						return nil, &schemaAdmissionError{reason: SchemaRegexpInvalidOrUnsupported}
 					}

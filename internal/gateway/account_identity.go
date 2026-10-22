@@ -104,14 +104,13 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 		g.mu.Unlock()
 		return nil
 	}
-	needed := false
+	allowed := make(map[string]bool)
 	for _, name := range p.allowed {
 		if strings.HasPrefix(name, system+"__") {
-			needed = true
-			break
+			allowed[name] = true
 		}
 	}
-	if !needed {
+	if len(allowed) == 0 {
 		g.invalidateLocked(id, system)
 		g.mu.Unlock()
 		return nil
@@ -146,7 +145,7 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 	g.operationWG.Add(1)
 	connection := g.systems[system]
 	g.mu.Unlock()
-	entries, err := g.discover(opCtx, connection, token)
+	entries, err := g.discover(opCtx, connection, token, allowed)
 	g.finishOperation(opID, event, started, err, false, permit)
 	g.mu.Lock()
 	defer g.mu.Unlock()
