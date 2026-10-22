@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -195,7 +196,7 @@ func connect(ctx context.Context, endpoint, token string) (*mcp.ClientSession, e
 		}
 	})
 
-	return client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: endpoint, HTTPClient: CredentialClient(token), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+	return client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: endpoint, HTTPClient: operationClient(ctx, token), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
 }
 
 func (g *Gateway) discover(ctx context.Context, system System, token string) (map[string]entry, error) {
@@ -205,6 +206,8 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (ma
 	if err != nil {
 		return nil, err
 	}
+	// Cleanup is synchronous and shares ctx. A cleanup error must not replace a
+	// complete discovery result or a confirmed tool outcome.
 	defer session.Close()
 	entries := map[string]entry{}
 	seen := map[string]bool{}
@@ -212,6 +215,9 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (ma
 	total := 0
 	totalBytes := 0
 	for page := 0; page < MaxPagesPerSystem; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		result, err := session.ListTools(ctx, &mcp.ListToolsParams{Cursor: cursor})
 		if err != nil {
 			return nil, err
@@ -221,6 +227,9 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (ma
 			return nil, errors.New("tool count limit")
 		}
 		for _, tool := range result.Tools {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if tool == nil || !validPart(tool.Name) || !toolNamePattern.MatchString(system.Name+"__"+tool.Name) {
 				return nil, errors.New("invalid downstream tool name")
 			}
@@ -255,6 +264,9 @@ func (g *Gateway) discover(ctx context.Context, system System, token string) (ma
 			entries[name] = entry{system, original, &copy, resolved}
 		}
 		if result.NextCursor == "" {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return entries, nil
 		}
 		if len(result.NextCursor) > 4096 || seen[result.NextCursor] {
@@ -433,6 +445,8 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.Cal
 	if err != nil {
 		return nil, errors.New("downstream unavailable")
 	}
+	// Cleanup is synchronous and shares ctx. A cleanup error must not replace a
+	// complete discovery result or a confirmed tool outcome.
 	defer session.Close()
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: e.original, Arguments: json.RawMessage(data)})
 	if err != nil {
@@ -479,23 +493,64 @@ func (g *Gateway) Handler() http.Handler {
 	})
 }
 
+// credentialTransport binds the SDK's detached connection/cleanup requests to the
+// original operation budget, while retaining cancellation from each request.
 type credentialTransport struct {
-	token string
-	base  http.RoundTripper
+	token     string
+	base      http.RoundTripper
+	operation context.Context
 }
 
 func (t credentialTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	copy := r.Clone(r.Context())
+	operation := t.operation
+	if operation == nil {
+		operation = context.Background()
+	}
+	if err := operation.Err(); err != nil {
+		return nil, err
+	}
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if deadline, ok := operation.Deadline(); ok {
+		ctx, cancel = context.WithDeadline(r.Context(), deadline)
+	} else {
+		ctx, cancel = context.WithCancel(r.Context())
+	}
+	stop := context.AfterFunc(operation, cancel)
+	// AfterFunc may be scheduled asynchronously if cancellation raced registration.
+	if err := operation.Err(); err != nil {
+		stop()
+		cancel()
+		return nil, err
+	}
+	release := func() { stop(); cancel() }
+	copy := r.Clone(ctx)
 	copy.Header.Set("Authorization", "Bearer "+t.token)
 	response, err := t.base.RoundTrip(copy)
 	if err != nil {
+		release()
 		return nil, err
 	}
-	response.Body = http.MaxBytesReader(nil, response.Body, 1<<20)
+	// Do not release at RoundTrip return: the context must also bound body reads.
+	response.Body = &operationBody{ReadCloser: http.MaxBytesReader(nil, response.Body, 1<<20), release: release}
 	return response, nil
 }
 
-// CredentialClient refuses redirects and bounds each HTTP response to 1 MiB.
-func CredentialClient(token string) *http.Client {
-	return &http.Client{Transport: credentialTransport{token, http.DefaultTransport}, Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
+type operationBody struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
 }
+
+func (b *operationBody) Close() error {
+	b.once.Do(b.release)
+	return b.ReadCloser.Close()
+}
+
+func operationClient(ctx context.Context, token string) *http.Client {
+	return &http.Client{Transport: credentialTransport{token: token, base: http.DefaultTransport, operation: ctx}, Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
+}
+
+// CredentialClient refuses redirects and bounds each HTTP response to 1 MiB.
+// Gateway operations use a separate client bound to their operation context.
+func CredentialClient(token string) *http.Client { return operationClient(context.Background(), token) }
