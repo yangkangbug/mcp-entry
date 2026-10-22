@@ -34,7 +34,7 @@ func (g *Gateway) AccountHandler(expectedOrigin string) (http.Handler, error) {
 	if err := g.validateAccountAuth(); err != nil {
 		return nil, err
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return g.GuardHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		accountHeaders(w)
 		if r.Host != u.Host || r.URL.RawQuery != "" || r.URL.ForceQuery || len(r.Header.Values("Origin")) > 1 || len(r.Header.Values("Authorization")) > 1 {
 			accountError(w, http.StatusForbidden, "request_denied")
@@ -206,7 +206,7 @@ func (g *Gateway) AccountHandler(expectedOrigin string) (http.Handler, error) {
 			}
 		}
 		accountJSON(w, http.StatusOK, result)
-	}), nil
+	})), nil
 }
 
 type accountBinding struct {

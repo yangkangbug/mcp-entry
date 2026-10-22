@@ -39,6 +39,8 @@ type snapshot struct {
 	handlers map[string]http.Handler
 }
 type Gateway struct {
+	ingress                 *ingressLimiter
+	rejections              rejectionSummary
 	auditArchivedUnfinished uint64
 	limiter                 *admissionLimiter
 	operationWG             sync.WaitGroup
@@ -156,6 +158,11 @@ func newGateway(cfg Config, bootstrap bool) (*Gateway, error) {
 		return nil, err
 	}
 	g.limiter = limiter
+	g.ingress, err = newIngressLimiter(cfg.Ingress, identities)
+	if err != nil {
+		return nil, err
+	}
+	g.rejections.status.Started = time.Now().UTC()
 	g.entryTokens = map[string][32]byte{}
 	g.entryStrong = map[string]bool{}
 	g.discoveryEpoch = map[discoveryKey]uint64{}
@@ -522,6 +529,7 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 	e, exists := g.evaluateLocked(id, name)
 	g.mu.Unlock()
 	if !exists {
+		g.rejectOperation(ctx, RejectionOperationAuthorization)
 		return nil, ErrDenied
 	}
 	if err := ctx.Err(); err != nil {
@@ -535,16 +543,19 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 	}
 	data, err := json.Marshal(args)
 	if err != nil || len(data) > 64<<10 {
+		g.rejectOperation(ctx, RejectionOperationArguments)
 		return nil, errors.New("invalid tool arguments")
 	}
 	var input any
 	if err := json.Unmarshal(data, &input); err != nil {
+		g.rejectOperation(ctx, RejectionOperationArguments)
 		return nil, errors.New("invalid tool arguments")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if err := e.input.Validate(input); err != nil {
+		g.rejectOperation(ctx, RejectionOperationArguments)
 		return nil, errors.New("arguments do not match discovered schema")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -555,6 +566,7 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 	current, ok := g.evaluateLocked(id, name)
 	if !ok || current.tool != e.tool || current.generation != e.generation || current.policyVersion != e.policyVersion {
 		g.mu.Unlock()
+		g.rejectOperation(ctx, RejectionOperationAuthorization)
 		return nil, ErrDenied
 	}
 	if err := ctx.Err(); err != nil {
@@ -563,6 +575,7 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 	}
 	permit, err := g.limiter.acquire(ctx, g.principals[id].identity, e.system.Name)
 	if err != nil {
+		g.rejectAdmission(ctx, err)
 		g.mu.Unlock()
 		return nil, err
 	}
@@ -621,7 +634,11 @@ func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler 
 	// catalog revision. It can never expose an old binding's schema as a new one.
 	server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			ctx = context.WithValue(ctx, operationRejectionKey{}, &operationRejection{})
 			result, err := next(ctx, method, req)
+			if err != nil {
+				g.rejectOperation(ctx, RejectionOperationProtocol)
+			}
 			if err != nil || method != "tools/list" {
 				return result, err
 			}
@@ -649,7 +666,7 @@ func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler 
 
 // Handler reauthenticates every request, never using session IDs as identities.
 func (g *Gateway) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return g.GuardHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Origin") != "" {
 			http.Error(w, "browser access disabled", http.StatusForbidden)
 			return
@@ -669,7 +686,7 @@ func (g *Gateway) Handler() http.Handler {
 			}
 		}
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-	})
+	}))
 }
 
 // credentialTransport binds the SDK's detached connection/cleanup requests to the

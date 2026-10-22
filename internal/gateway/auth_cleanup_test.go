@@ -219,14 +219,28 @@ func TestAuthModesStatefulCleanupPreservesConfirmedCall(t *testing.T) {
 			f.block.enabled.Store(true)
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancel()
+			completed := make(chan time.Time, 1)
 			result := authCleanupStart(t, f, func() cleanupCallResult {
 				value, err := g.Call(ctx, "alice", "test__whoami", map[string]any{})
+				completed <- time.Now()
 				return cleanupCallResult{value, err}
 			})
 			requestCtx := cleanupReceive(t, f.block.started, time.Second, "authenticated DELETE")
 			got := cleanupReceive(t, result, 2*time.Second, "caller deadline cleanup")
+			deadline, _ := ctx.Deadline()
+			if finished := <-completed; finished.Before(deadline) {
+				t.Fatalf("cleanup returned %v before caller deadline", deadline.Sub(finished))
+			}
+			// The transport and parent context share a deadline, but their
+			// timer callbacks need not run in parent-first order. Assert the
+			// real completion boundary, then require parent cancellation too.
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+				t.Fatal("parent deadline did not cancel")
+			}
 			if ctx.Err() != context.DeadlineExceeded {
-				t.Fatalf("cleanup returned before caller deadline: %v", ctx.Err())
+				t.Fatalf("unexpected parent cancellation: %v", ctx.Err())
 			}
 			authCleanupResult(t, got, "alice")
 			cleanupAssertReleased(t, f.block, requestCtx)

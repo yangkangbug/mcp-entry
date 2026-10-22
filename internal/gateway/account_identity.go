@@ -122,6 +122,7 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 	}
 	permit, err := g.limiter.acquire(ctx, p.identity, system)
 	if err != nil {
+		g.rejectAdmission(ctx, err)
 		g.mu.Unlock()
 		return discoveryFailure(id, system, "discovery admission limited", err)
 	}

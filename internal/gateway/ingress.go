@@ -1,0 +1,164 @@
+package gateway
+
+import (
+	"context"
+	"math"
+	"net/http"
+	"sync"
+	"time"
+)
+
+const IngressMaxHeaderBytes = 16 << 10
+const IngressReadTimeout = 15 * time.Second
+
+// IngressConfig is separate from downstream admission; zero fields use defaults.
+type IngressConfig struct {
+	Global    AdmissionLimit `json:"global,omitempty"`
+	Principal AdmissionLimit `json:"principal,omitempty"`
+}
+type ingressLimiter struct {
+	mu         sync.Mutex
+	global     admissionBucket
+	principals map[Identity]*admissionBucket
+}
+
+func newIngressLimiter(cfg IngressConfig, identities []Identity) (*ingressLimiter, error) {
+	global, err := normalizeAdmissionLimit(cfg.Global, AdmissionLimit{128, 320, 512})
+	if err != nil {
+		return nil, err
+	}
+	principal, err := normalizeAdmissionLimit(cfg.Principal, AdmissionLimit{16, 40, 64})
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	l := &ingressLimiter{global: admissionBucket{limit: global, tokens: float64(global.Burst), last: now}, principals: make(map[Identity]*admissionBucket, len(identities))}
+	for _, id := range identities {
+		l.principals[id] = &admissionBucket{limit: principal, tokens: float64(principal.Burst), last: now}
+	}
+	return l, nil
+}
+func (l *ingressLimiter) acquire(b *admissionBucket) (func(), bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if b == nil {
+		return nil, false
+	}
+	now := time.Now()
+	if now.After(b.last) {
+		b.tokens = math.Min(float64(b.limit.Burst), b.tokens+now.Sub(b.last).Seconds()*b.limit.RatePerSecond)
+		b.last = now
+	}
+	if b.active >= b.limit.MaxConcurrent || b.tokens < 1 {
+		return nil, false
+	}
+	b.active++
+	b.tokens--
+	var once sync.Once
+	return func() { once.Do(func() { l.mu.Lock(); b.active--; l.mu.Unlock() }) }, true
+}
+
+type ingressContextKey struct{}
+type ingressScope struct{ gateway *Gateway }
+
+// GuardHTTP bounds shared ingress before parsing or route authentication. The
+// identity check here selects a bucket only; routes MUST reauthenticate. A global
+// attempt remains charged if the principal bucket refuses it. There is no queue.
+// Host servers must bound raw headers and read time, including when the writer
+// does not support ResponseController deadlines. No read goroutine is spawned.
+func (g *Gateway) GuardHTTP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if scope, ok := r.Context().Value(ingressContextKey{}).(*ingressScope); ok && scope.gateway == g {
+			next.ServeHTTP(w, r)
+			return
+		}
+		controller := http.NewResponseController(w)
+		// Keep the deadline through net/http finishRequest: it may drain an
+		// unread rejected body after this handler returns. The host resets the
+		// deadline for the next request/stream. Never clear its finite budget.
+		deadline := time.Now().Add(IngressReadTimeout)
+		if earlier, ok := r.Context().Deadline(); ok && earlier.Before(deadline) {
+			deadline = earlier
+		}
+		_ = controller.SetReadDeadline(deadline)
+		release, ok := g.ingress.acquire(&g.ingress.global)
+		if !ok {
+			g.rejections.record(RejectionIngressGlobal)
+			http.Error(w, "request capacity exceeded", http.StatusTooManyRequests)
+			return
+		}
+		defer release()
+		size := len(r.Host) + len(r.RequestURI)
+		for key, values := range r.Header {
+			size += len(key)
+			for _, value := range values {
+				size += len(value) + 4
+			}
+			if size > IngressMaxHeaderBytes {
+				break
+			}
+		}
+		if size > IngressMaxHeaderBytes {
+			g.rejections.record(RejectionRequest)
+			http.Error(w, "request headers too large", http.StatusRequestHeaderFieldsTooLarge)
+			return
+		}
+		if identity, valid := g.authenticateEntry(r); valid {
+			releasePrincipal, admitted := g.ingress.acquire(g.ingress.principals[identity])
+			if !admitted {
+				g.rejections.record(RejectionIngressPrincipal)
+				http.Error(w, "request capacity exceeded", http.StatusTooManyRequests)
+				return
+			}
+			defer releasePrincipal()
+		}
+
+		r = r.WithContext(context.WithValue(r.Context(), ingressContextKey{}, &ingressScope{g}))
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		observer := &rejectionWriter{ResponseWriter: w, summary: &g.rejections}
+		var wrapped http.ResponseWriter = observer
+		if _, ok := w.(http.Flusher); ok {
+			wrapped = &flushingRejectionWriter{observer}
+		}
+		next.ServeHTTP(wrapped, r)
+	})
+}
+
+type rejectionWriter struct {
+	http.ResponseWriter
+	summary *rejectionSummary
+	wrote   bool
+}
+
+func (w *rejectionWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *rejectionWriter) WriteHeader(status int) {
+	if !w.wrote && status >= 200 {
+		w.wrote = true
+		switch {
+		case status == 401:
+			w.summary.record(RejectionAuthentication)
+		case status == 403:
+			w.summary.record(RejectionAuthorization)
+		case status >= 400 && status < 500:
+			w.summary.record(RejectionRequest)
+		case status >= 500:
+			w.summary.record(RejectionHTTPUnavailable)
+		}
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+func (w *rejectionWriter) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+type flushingRejectionWriter struct{ *rejectionWriter }
+
+func (w *flushingRejectionWriter) Flush() {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	w.ResponseWriter.(http.Flusher).Flush()
+}

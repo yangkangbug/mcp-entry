@@ -397,6 +397,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err != nil {
 		return errors.New("cannot bind configured listener")
 	}
+	listener = newBoundedListener(listener, maxInboundConnections)
 	defer listener.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -420,7 +421,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		mux.Handle("/account", account)
 		mux.Handle("/account/", account)
 	}
-	server := &http.Server{TLSConfig: tlsConfig, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+	server := newGatewayHTTPServer(g.GuardHTTP(mux), tlsConfig)
 	done := make(chan error, 1)
 	go func() {
 		if tlsConfig != nil {

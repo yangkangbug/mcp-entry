@@ -19,6 +19,7 @@ var (
 
 // Config is deliberately a local, synthetic-credential configuration, not a vault.
 type Config struct {
+	Ingress IngressConfig   `json:"ingress,omitempty"`
 	Limits  LimitsConfig    `json:"limits,omitempty"`
 	Audit   AuditConfig     `json:"audit,omitempty"`
 	Systems []System        `json:"systems"`
