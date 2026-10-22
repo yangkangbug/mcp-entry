@@ -26,12 +26,15 @@ func fixture(t *testing.T) (*gateway.Gateway, *httptest.Server) {
 	t.Cleanup(crm.Close)
 	docs := httptest.NewServer(mock.Handler("docs", map[string]string{"a-docs": "alice"}))
 	t.Cleanup(docs.Close)
-	g, err := gateway.New([]gateway.Route{{"crm__echo", "crm", "echo", crm.URL}, {"docs__echo", "docs", "echo", docs.URL}}, map[string]gateway.User{
+	g, err := gateway.New(gateway.Config{Systems: []gateway.System{{Name: "crm", Endpoint: crm.URL}, {Name: "docs", Endpoint: docs.URL}}, Users: map[string]gateway.User{
 		"alice": {Token: "alice-token", Allowed: []string{"crm__echo", "docs__echo"}, Credentials: map[string]string{"crm": "a-crm", "docs": "a-docs"}},
 		"bob":   {Token: "bob-token", Allowed: []string{"crm__echo"}, Credentials: map[string]string{"crm": "b-crm"}},
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if issues := g.Refresh(context.Background()); len(issues) != 0 {
+		t.Fatal(issues)
 	}
 	server := httptest.NewServer(g.Handler())
 	t.Cleanup(server.Close)
@@ -167,10 +170,11 @@ func TestDownstreamInitializationFailure(t *testing.T) {
 		http.Error(w, "secret-internal-error", 503)
 	}))
 	defer s.Close()
-	g, err := gateway.New([]gateway.Route{{"crm__echo", "crm", "echo", s.URL}}, map[string]gateway.User{"alice": {Token: "a", Allowed: []string{"crm__echo"}, Credentials: map[string]string{"crm": "synthetic"}}})
+	g, err := gateway.New(gateway.Config{Systems: []gateway.System{{Name: "crm", Endpoint: s.URL}}, Users: map[string]gateway.User{"alice": {Token: "a", Allowed: []string{"crm__echo"}, Credentials: map[string]string{"crm": "synthetic"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	g.Refresh(context.Background())
 	_, err = g.Call(context.Background(), "alice", "crm__echo", map[string]any{"message": "x"})
 	if err == nil || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("unsafe error: %v", err)
@@ -185,14 +189,17 @@ func TestDownstreamInitializationFailure(t *testing.T) {
 }
 
 func TestRejectAmbiguousOrRemoteRoutes(t *testing.T) {
-	for _, route := range []gateway.Route{{"crm__echo", "crm", "echo", "https://example.com"}, {"wrong", "crm", "echo", "http://127.0.0.1:9000"}, {"a__b__c", "a__b", "c", "http://127.0.0.1:9000"}} {
-		if _, err := gateway.New([]gateway.Route{route}, nil); err == nil {
-			t.Fatalf("accepted %+v", route)
+	for _, system := range []gateway.System{{Name: "crm", Endpoint: "https://example.com"}, {Name: "a__b", Endpoint: "http://127.0.0.1:9000"}} {
+		if _, err := gateway.New(gateway.Config{Systems: []gateway.System{system}}); err == nil {
+			t.Fatalf("accepted %+v", system)
 		}
 	}
-	route := gateway.Route{"crm__echo", "crm", "echo", "http://127.0.0.1:9000"}
-	if _, err := gateway.New([]gateway.Route{route, route}, nil); err == nil {
+	system := gateway.System{Name: "crm", Endpoint: "http://127.0.0.1:9000"}
+	if _, err := gateway.New(gateway.Config{Systems: []gateway.System{system, system}}); err == nil {
 		t.Fatal("duplicate accepted")
+	}
+	if _, err := gateway.New(gateway.Config{Systems: []gateway.System{system}, Users: map[string]gateway.User{"alice": {Token: "a", Allowed: []string{"wrong"}}}}); err == nil {
+		t.Fatal("ambiguous policy accepted")
 	}
 }
 
@@ -233,10 +240,11 @@ func TestToolCallTransportFailureNotRetried(t *testing.T) {
 		downstream.ServeHTTP(w, r)
 	}))
 	defer s.Close()
-	g, err := gateway.New([]gateway.Route{{"crm__echo", "crm", "echo", s.URL}}, map[string]gateway.User{"alice": {Token: "a", Allowed: []string{"crm__echo"}, Credentials: map[string]string{"crm": "synthetic"}}})
+	g, err := gateway.New(gateway.Config{Systems: []gateway.System{{Name: "crm", Endpoint: s.URL}}, Users: map[string]gateway.User{"alice": {Token: "a", Allowed: []string{"crm__echo"}, Credentials: map[string]string{"crm": "synthetic"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	g.Refresh(context.Background())
 	_, err = g.Call(context.Background(), "alice", "crm__echo", map[string]any{"message": "x"})
 	if err == nil || strings.Contains(err.Error(), "secret") || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("unsafe/incorrect error: %v", err)
@@ -259,10 +267,11 @@ func TestMissingCredentialFailsClosed(t *testing.T) {
 	var hits atomic.Int32
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
 	defer s.Close()
-	g, err := gateway.New([]gateway.Route{{"crm__echo", "crm", "echo", s.URL}}, map[string]gateway.User{"alice": {Token: "a", Allowed: []string{"crm__echo"}}})
+	g, err := gateway.New(gateway.Config{Systems: []gateway.System{{Name: "crm", Endpoint: s.URL}}, Users: map[string]gateway.User{"alice": {Token: "a", Allowed: []string{"crm__echo"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	g.Refresh(context.Background())
 	if _, err := g.Call(context.Background(), "alice", "crm__echo", map[string]any{"message": "x"}); !errors.Is(err, gateway.ErrDenied) {
 		t.Fatal(err)
 	}
@@ -272,25 +281,33 @@ func TestMissingCredentialFailsClosed(t *testing.T) {
 }
 
 func TestConfigurationCopied(t *testing.T) {
+	downstream := httptest.NewServer(mock.Handler("crm", map[string]string{"original-credential": "bob"}))
+	defer downstream.Close()
 	users := map[string]gateway.User{"bob": {Token: "original", Allowed: []string{"crm__echo"}, Credentials: map[string]string{"crm": "original-credential"}}}
-	routes := []gateway.Route{{"crm__echo", "crm", "echo", "http://127.0.0.1:9000"}, {"docs__echo", "docs", "echo", "http://127.0.0.1:9001"}}
-	g, err := gateway.New(routes, users)
+	systems := []gateway.System{{Name: "crm", Endpoint: downstream.URL}, {Name: "docs", Endpoint: downstream.URL}}
+	g, err := gateway.New(gateway.Config{Systems: systems, Users: users})
 	if err != nil {
 		t.Fatal(err)
 	}
 	users["bob"].Allowed[0] = "docs__echo"
 	users["bob"].Credentials["crm"] = "mutated"
-	routes[0].Name = "mutated"
+	systems[0].Name = "mutated"
+	if issues := g.Refresh(context.Background()); len(issues) != 0 {
+		t.Fatal(issues)
+	}
 	if got := g.Names("bob"); !reflect.DeepEqual(got, []string{"crm__echo"}) {
-		t.Fatalf("policy modified through caller config: %v", got)
+		t.Fatalf("configuration mutation: %v", got)
+	}
+	result, err := g.Call(context.Background(), "bob", "crm__echo", map[string]any{"message": "copy"})
+	if err != nil || result.IsError {
+		t.Fatalf("credential copy failed: %v %v", result, err)
 	}
 }
 
 func TestRejectInvalidToolNames(t *testing.T) {
 	for _, system := range []string{"has space", "路径", strings.Repeat("a", 123)} {
-		route := gateway.Route{system + "__echo", system, "echo", "http://127.0.0.1:9000"}
-		if _, err := gateway.New([]gateway.Route{route}, nil); err == nil {
-			t.Fatalf("invalid name accepted: %q", route.Name)
+		if _, err := gateway.New(gateway.Config{Systems: []gateway.System{{Name: system, Endpoint: "http://127.0.0.1:9000"}}}); err == nil {
+			t.Fatalf("invalid name accepted: %q", system)
 		}
 	}
 }

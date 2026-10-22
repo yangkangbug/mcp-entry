@@ -3,8 +3,9 @@ package mock
 
 import (
 	"context"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"net/http"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type Input struct {

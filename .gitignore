@@ -5,3 +5,8 @@
 /bin/
 coverage.out
 *.test
+# Local/personal configuration: only the synthetic example is tracked.
+configs/*.json
+!configs/demo.json
+configs/private/
+*.local.json

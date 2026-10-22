@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"github.com/yangkangbug/mcp-entry/internal/gateway"
-	"github.com/yangkangbug/mcp-entry/internal/mock"
 	"log"
 	"net"
 	"net/http"
@@ -11,6 +9,9 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/yangkangbug/mcp-entry/internal/gateway"
+	"github.com/yangkangbug/mcp-entry/internal/mock"
 )
 
 func main() {
@@ -34,12 +35,18 @@ func main() {
 	}
 	crm := start("127.0.0.1:0", mock.Handler("crm", map[string]string{"mock-crm-alice": "alice", "mock-crm-bob": "bob"}))
 	docs := start("127.0.0.1:0", mock.Handler("docs", map[string]string{"mock-docs-alice": "alice"}))
-	g, err := gateway.New([]gateway.Route{{Name: "crm__echo", System: "crm", Tool: "echo", Endpoint: crm}, {Name: "docs__echo", System: "docs", Tool: "echo", Endpoint: docs}}, map[string]gateway.User{
+	g, err := gateway.New(gateway.Config{Systems: []gateway.System{{Name: "crm", Endpoint: crm}, {Name: "docs", Endpoint: docs}}, Users: map[string]gateway.User{
 		"alice": {Token: "demo-alice", Allowed: []string{"crm__echo", "docs__echo"}, Credentials: map[string]string{"crm": "mock-crm-alice", "docs": "mock-docs-alice"}},
 		"bob":   {Token: "demo-bob", Allowed: []string{"crm__echo"}, Credentials: map[string]string{"crm": "mock-crm-bob"}},
-	})
+	}})
 	if err != nil {
 		log.Fatal(err)
+	}
+	discoveryCtx, cancelDiscovery := context.WithTimeout(ctx, 30*time.Second)
+	issues := g.Refresh(discoveryCtx)
+	cancelDiscovery()
+	for _, issue := range issues {
+		log.Printf("discovery unavailable: user=%q system=%q", issue.User, issue.System)
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", g.Handler())

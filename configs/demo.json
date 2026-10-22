@@ -1,0 +1,18 @@
+{
+  "systems": [
+    {"name": "crm", "endpoint": "http://127.0.0.1:9001/mcp"},
+    {"name": "docs", "endpoint": "http://127.0.0.1:9002/mcp"}
+  ],
+  "users": {
+    "alice": {
+      "token": "demo-alice",
+      "allowed": ["crm__echo", "docs__echo"],
+      "credentials": {"crm": "mock-crm-alice", "docs": "mock-docs-alice"}
+    },
+    "bob": {
+      "token": "demo-bob",
+      "allowed": ["crm__echo"],
+      "credentials": {"crm": "mock-crm-bob"}
+    }
+  }
+}
