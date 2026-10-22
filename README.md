@@ -117,7 +117,7 @@ go run ./cmd/gateway -config configs/demo.json -listen 127.0.0.1:8080
 这个命令只启动网关，不会自动启动任何下游。示例配置中的 9001、9002 是占位的本地 MCP 地址；需先自行运行对应模拟 MCP 服务，或替换为已运行的本地测试服务地址与虚构凭证。若地址不可用，网关会报告发现失败，并提供空的或部分可用的目录，不会假装连接成功。
 
 配置包括：
-- systems：唯一系统名及字面回环 HTTP 地址。
+- systems：唯一系统名、字面回环 HTTP 地址及可选下游认证头模式（默认 Bearer，另支持 raw Authorization 和 API-key header），见 [下游凭证请求头](docs/downstream-auth.md)。
 - users：虚构身份、入口 token、完整工具名白名单，以及按系统索引的模拟下游 token。
 
 个人测试配置请复制为 `configs/dev.local.json`；除公开虚构示例 `configs/demo.json` 外，configs 下 JSON 配置默认忽略。不要在示例中填入真实凭证；gitignore 不是凭证保护或保险库。

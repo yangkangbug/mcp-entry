@@ -52,3 +52,24 @@ func TestOnlyToolCapabilitiesAdvertised(t *testing.T) {
 		t.Fatal("tool capability missing")
 	}
 }
+
+func TestAuthConfigLoading(t *testing.T) {
+	for _, auth := range []string{`{}`, `{"mode":"bearer"}`, `{"mode":"raw"}`, `{"mode":"api_key","header":"X-API-Key"}`} {
+		t.Run(auth, func(t *testing.T) {
+			text := `{"systems":[{"name":"crm","endpoint":"http://127.0.0.1:9001/mcp","auth":` + auth + `}],"users":{"alice":{"token":"demo","allowed":["crm__echo"],"credentials":{"crm":"synthetic"}}}}`
+			cfg, err := gateway.LoadConfig(strings.NewReader(text))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := gateway.New(cfg); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for _, auth := range []string{`{"mode":"api_key","header":"X-API-Key","credential":"synthetic"}`, `{"mode":"bearer","headers":{}}`, `"bearer"`, `[]`} {
+		text := `{"systems":[{"name":"crm","endpoint":"http://127.0.0.1:9001/mcp","auth":` + auth + `}]}`
+		if _, err := gateway.LoadConfig(strings.NewReader(text)); err == nil {
+			t.Fatalf("invalid auth configuration accepted: %s", auth)
+		}
+	}
+}

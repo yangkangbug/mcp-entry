@@ -62,6 +62,11 @@ func New(cfg Config) (*Gateway, error) {
 		if _, exists := g.systems[system.Name]; exists {
 			return nil, errors.New("duplicate system")
 		}
+		auth, err := normalizeAuth(system.Auth)
+		if err != nil {
+			return nil, err
+		}
+		system.Auth = auth
 		g.systems[system.Name] = system
 	}
 	tokens := map[string]bool{}
@@ -80,7 +85,7 @@ func New(cfg Config) (*Gateway, error) {
 			}
 		}
 		for system, token := range user.Credentials {
-			if _, ok := g.systems[system]; !ok || len(token) > 4096 || strings.ContainsAny(token, "\r\n") {
+			if connection, ok := g.systems[system]; !ok || !validCredential(token, connection.Auth) {
 				return nil, errors.New("invalid system credential configuration")
 			}
 			clone.Credentials[system] = token
@@ -166,7 +171,7 @@ func (g *Gateway) Refresh(ctx context.Context) []DiscoveryIssue {
 	return issues
 }
 
-func connect(ctx context.Context, endpoint, token string) (*mcp.ClientSession, error) {
+func connect(ctx context.Context, system System, token string) (*mcp.ClientSession, error) {
 	client := mcp.NewClient(&mcp.Implementation{Name: "mcp-entry", Version: "0.2.0-demo"}, &mcp.ClientOptions{MultiRoundTrip: &mcp.MultiRoundTripOptions{Disabled: true}})
 	// Validate before SDK ListTools filters malformed header annotations or dereferences
 	// nil entries. A malformed catalog must fail as a whole, not become a partial list.
@@ -214,13 +219,13 @@ func connect(ctx context.Context, endpoint, token string) (*mcp.ClientSession, e
 		}
 	})
 
-	return client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: endpoint, HTTPClient: operationClient(ctx, token), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+	return client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: system.Endpoint, HTTPClient: systemOperationClient(ctx, token, system.Auth), MaxRetries: -1, DisableStandaloneSSE: true}, nil)
 }
 
 func (g *Gateway) discover(ctx context.Context, system System, token string) (map[string]entry, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	session, err := connect(ctx, system.Endpoint, token)
+	session, err := connect(ctx, system, token)
 	if err != nil {
 		return nil, err
 	}
@@ -465,7 +470,7 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (*mcp.Cal
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	session, err := connect(ctx, e.system.Endpoint, token)
+	session, err := connect(ctx, e.system, token)
 	if err != nil {
 		return nil, errors.New("downstream unavailable")
 	}
@@ -520,6 +525,7 @@ func (g *Gateway) Handler() http.Handler {
 // credentialTransport binds the SDK's detached connection/cleanup requests to the
 // original operation budget, while retaining cancellation from each request.
 type credentialTransport struct {
+	auth      AuthConfig
 	token     string
 	base      http.RoundTripper
 	operation context.Context
@@ -549,7 +555,25 @@ func (t credentialTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 	}
 	release := func() { stop(); cancel() }
 	copy := r.Clone(ctx)
-	copy.Header.Set("Authorization", "Bearer "+t.token)
+	header, value := "Authorization", t.token
+	switch t.auth.Mode {
+	case "", "bearer":
+		value = "Bearer " + t.token
+	case "raw":
+	case "api_key":
+		header = t.auth.Header
+	default:
+		release()
+		return nil, errors.New("unsupported authentication mode")
+	}
+	// Clone has its own header map. Remove all casing variants, not just the
+	// canonical entry, so an existing header cannot become a second credential.
+	for name := range copy.Header {
+		if strings.EqualFold(name, "Authorization") || strings.EqualFold(name, header) {
+			delete(copy.Header, name)
+		}
+	}
+	copy.Header.Set(header, value)
 	response, err := t.base.RoundTrip(copy)
 	if err != nil {
 		release()
@@ -571,8 +595,12 @@ func (b *operationBody) Close() error {
 	return b.ReadCloser.Close()
 }
 
+func systemOperationClient(ctx context.Context, token string, auth AuthConfig) *http.Client {
+	return &http.Client{Transport: credentialTransport{auth: auth, token: token, base: http.DefaultTransport, operation: ctx}, Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
+}
+
 func operationClient(ctx context.Context, token string) *http.Client {
-	return &http.Client{Transport: credentialTransport{token: token, base: http.DefaultTransport, operation: ctx}, Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
+	return systemOperationClient(ctx, token, AuthConfig{Mode: "bearer"})
 }
 
 // CredentialClient refuses redirects and bounds each HTTP response to 1 MiB.

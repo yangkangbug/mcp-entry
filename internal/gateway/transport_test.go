@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -78,5 +79,43 @@ func TestOperationTransportCancellationDuringBody(t *testing.T) {
 	case <-requestContext.Done():
 	case <-time.After(time.Second):
 		t.Fatal("operation cancellation did not reach response lifetime")
+	}
+}
+
+func TestAuthTransportReplacesCaseVariantsWithoutMutatingRequest(t *testing.T) {
+	for _, auth := range []AuthConfig{{Mode: "bearer"}, {Mode: "raw"}, {Mode: "api_key", Header: "X-API-Key"}} {
+		t.Run(auth.Mode, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1", nil)
+			req.Header = http.Header{
+				"authorization": {"old-lower"}, "Authorization": {"old-upper"},
+				"Mcp-Session-Id": {"synthetic-session"},
+			}
+			if auth.Mode == "api_key" {
+				req.Header["x-api-key"] = []string{"old-key-lower"}
+				req.Header["X-Api-Key"] = []string{"old-key-upper"}
+			}
+			original := req.Header.Clone()
+			base := roundTripFunc(func(sent *http.Request) (*http.Response, error) {
+				name, value := "Authorization", "synthetic"
+				if auth.Mode == "bearer" {
+					value = "Bearer synthetic"
+				} else if auth.Mode == "api_key" {
+					name = "X-Api-Key"
+				}
+				want := http.Header{name: {value}, "Mcp-Session-Id": {"synthetic-session"}}
+				if !reflect.DeepEqual(sent.Header, want) {
+					t.Fatalf("outbound headers=%v, want %v", sent.Header, want)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+			})
+			response, err := (credentialTransport{auth: auth, token: "synthetic", base: base}).RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = response.Body.Close()
+			if !reflect.DeepEqual(req.Header, original) {
+				t.Fatal("transport mutated original request headers")
+			}
+		})
 	}
 }
