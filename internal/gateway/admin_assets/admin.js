@@ -15,8 +15,15 @@
       serviceName:'',
       policySearch:'',
       preview:null,
+      lifecyclePreview:null,
+      lifecycleForm:{},
+      entrySecret:null,
       audit:null,
       draft:null,
+      draftApplied:false,
+      registry:null,
+      configPreview:null,
+      configUnknown:null,
       policyDraft:null,
       configForm: {},
       notice:null
@@ -44,8 +51,8 @@
         'Inspect retained events, without presenting samples as a global success rate.'],
       config:['配置与维护',
         'Configuration',
-        '准备接入草稿并静态校验。校验不联网、不应用配置，也不重启网关。',
-        'Prepare and statically validate a draft. Validation does not connect, apply or restart.']
+        '校验草稿，或预览并确认受支持的服务变更。配置生效不等于服务连通或工具已发现。',
+        'Validate a draft, or preview and confirm supported service changes. Applied configuration does not prove connectivity or discovery.']
     };
     const text = (zh,
       en) => state.lang === 'en' ? en : zh;
@@ -226,6 +233,8 @@
     function navigate(page) {
       state.viewRevision++;
       state.page=page;
+      state.configPreview=null;
+      clearLifecycle();
       state.preview=null;
       state.policyDraft=null;
       render();
@@ -241,8 +250,8 @@
       const users=state.snapshot?.users||[];
       if(!users.length) {
         empty(parent,
-          '尚无已配置用户。新增身份需要离线配置与拓扑迁移支持。',
-          'No configured users. New identities require offline configuration and topology migration support.');
+          '尚无用户。可在用户与入口 token 页面创建身份（需要后端支持）。',
+          'No users yet. Create an identity on Users & gateway tokens when supported.');
         return null;
       }
       if(!user())state.userKey=key(users[0]);
@@ -264,6 +273,7 @@
         ()=> {
           state.viewRevision++;
           state.userKey=sel.value;
+          clearLifecycle();
           state.preview=null;
           state.policyDraft=null;
           state.policySearch='';
@@ -282,12 +292,14 @@
     function disconnect() {
       state.epoch++;
       state.token='';
+      clearLifecycle();
       state.busy=false;
       state.snapshot=null;
       state.audit=null;
       state.preview=null;
       state.policyDraft=null;
-      state.draft=null;
+      state.draft=null;state.draftApplied=false;
+      state.registry=null;state.configPreview=null;state.configUnknown=null;
       state.configForm= {
       };
       state.userKey='';
@@ -368,6 +380,8 @@
     async function refresh() {
       if(state.busy||!state.token)return;
       const epoch=state.epoch;
+      clearLifecycle();
+      state.configPreview=null;
       setBusy(true);
       try {
         state.snapshot=await request('snapshot');
@@ -385,6 +399,8 @@
     async function mutate(body, confirm) {
       if(state.busy)return;
       const epoch=state.epoch;
+      state.lifecyclePreview=null;
+      state.entrySecret=null;
       const context=state.userKey;
       const page=state.page;
       const viewRevision=state.viewRevision;
@@ -559,7 +575,7 @@
     }
     function renderOverview(c) {
       if(!state.snapshot.services.length) {
-        const p=panel(text('接入第一个 MCP 服务','Connect your first MCP service'),text('先生成并校验本地草稿；在线应用尚未开放。','Start with a local draft. Online application is not available.'));
+        const p=panel(text('接入第一个 MCP 服务','Connect your first MCP service'),text('先读取运行配置并准备草稿；受支持的持久模式可预览并确认新增服务。','Read running configuration and prepare a draft. Supported persistent storage allows previewing and confirming service additions.'));
         p.classList.add('hero');
         append(p,button(text('准备接入配置','Prepare service configuration'),()=>navigate('config'),'primary'));
         c.appendChild(p);
@@ -584,7 +600,7 @@
         append(attention,button(text('管理工具授权','Manage tool access'),()=>navigate('policy')),button(text('准备接入配置','Prepare service configuration'),()=>navigate('config')));
         c.appendChild(attention);
       }
-      c.appendChild(help(text('运行范围与尚未采集的指标','Operating scope and unavailable metrics'),text('P95 延迟尚未采集；全站成功率缺少完整分母与时间窗口。已保存凭据不证明认证有效。'+(state.snapshot.persistent?'持久状态开启；拓扑变更仍需迁移。':'内存存储：重启会丢失动态状态。'),'P95 is not collected; global success rate lacks a complete denominator and window. Stored credentials do not prove authentication. '+(state.snapshot.persistent?'Persistent state; topology changes still require migration.':'In-memory storage loses dynamic state on restart.'))));
+      c.appendChild(help(text('运行范围与尚未采集的指标','Operating scope and unavailable metrics'),text('P95 延迟尚未采集；全站成功率缺少完整分母与时间窗口。已保存凭据不证明认证有效。'+(state.snapshot.persistent?'持久状态开启；仅支持受控新增服务与超时更新，其他拓扑变更仍受限制。':'内存存储：重启会丢失动态状态。'),'P95 is not collected; global success rate lacks a complete denominator and window. Stored credentials do not prove authentication. '+(state.snapshot.persistent?'Persistent state supports controlled additions and timeout updates; other topology changes remain restricted.':'In-memory storage loses dynamic state on restart.'))));
     }
     function renderServices(c) {
       const p=panel(text('已配置服务','Configured services'),text('按身份查看绑定与目录；认证健康未检查。','Inspect bindings and discovery by identity; authentication health is not checked.'));
@@ -613,15 +629,108 @@
       append(d,button(text('查看运行与审计','View operations & audit'),()=>navigate('audit')),el('small',text('审计入口展示保留事件样本，不按此服务筛选。','Audit shows retained event samples, not a service-filtered view.')));
       c.appendChild(d);
     }
+    function clearLifecycle() {
+      state.lifecyclePreview=null;
+      state.lifecycleForm={};
+      state.entrySecret=null;
+    }
+    function lifecycleAction(action) {
+      return ({create_user:text('创建用户','Create user'),issue_entry:text('颁发入口 token','Issue gateway token'),rotate_entry:text('轮换入口 token','Rotate gateway token'),revoke_entry:text('撤销入口 token','Revoke gateway token')})[action];
+    }
+    function lifecycleField(parent, id, zh, en) {
+      const label=el('label',text(zh,en)), input=el('input');
+      label.htmlFor=id;input.id=id;input.value=state.lifecycleForm[id]||'';
+      input.autocomplete='off';input.disabled=state.busy;
+      input.addEventListener('input',()=> {
+        state.lifecycleForm[id]=input.value;state.viewRevision++;
+        state.lifecyclePreview=null;$('lifecycle-confirmation')?.remove();
+      });
+      append(parent,label,input);return input;
+    }
+    async function lifecycle(body, confirmationID) {
+      if(state.busy)return;
+      const epoch=state.epoch, revision=state.viewRevision, context=state.userKey;
+      const confirm=!!confirmationID;
+      state.preview=null;state.lifecyclePreview=null;state.entrySecret=null;
+      setBusy(true);
+      let committed=false;
+      try {
+        const result=await request('lifecycle',{...body,preview:!confirm,...(confirm?{confirm:true,confirmation_id:confirmationID}:{})});
+        if(confirm?result.applied!==true:result.preview!==true||!result.confirmation_id)throw {code:'invalid_response'};
+        if(confirm) {
+          committed=true;
+          if(revision===state.viewRevision&&context===state.userKey&&state.page==='users'&&typeof result.token==='string'&&result.token) {
+            state.entrySecret={token:result.token,tenant:body.tenant,principal:body.principal,expires_at:result.entry?.expires_at};
+          }
+          state.snapshot=await request('snapshot');
+          if(revision===state.viewRevision&&state.page==='users') {
+            state.userKey=key(body);state.lifecycleForm={};
+          }
+          notify('操作已提交，状态已刷新。入口秘密仅在本次成功响应后展示，关闭后无法取回。','Operation committed and state refreshed. A gateway secret is shown only from this successful response and cannot be retrieved after dismissal.');
+        }else if(revision===state.viewRevision&&context===state.userKey&&state.page==='users') {
+          state.lifecyclePreview={body,confirmationID:result.confirmation_id,expires:result.confirmation_expires_at};
+          notify('预览已通过。请核对身份、到期时间与影响，再确认。','Preview passed. Check identity, expiry and impact before confirming.');
+        }
+      }catch(e) {
+        if(committed&&!e.stale&&e.status!==401)notify('操作已提交，但状态刷新失败。请刷新核对，不要重复提交；已展示的秘密关闭后不能取回。','Operation committed, but state refresh failed. Refresh to verify; do not resubmit. A displayed secret cannot be retrieved after dismissal.',true);
+        else if(confirm&&!e.stale&&e.status!==401&&e.status!==409)notify('未能确认操作结果，不要直接重复提交。先刷新核对入口版本；若新 token 未收到，需重新预览轮换，无法取回旧秘密。','Outcome unknown; do not repeat the submission. Refresh and check the gateway version. If the new token was not received, preview a new rotation; the old secret cannot be retrieved.',true);
+        else showError(e,confirm);
+      }finally {if(epoch===state.epoch)setBusy(false);}
+    }
+    function lifecycleConfirmation(c) {
+      const preview=state.lifecyclePreview;if(!preview)return;
+      const b=preview.body,p=panel(text('确认用户 / 入口变更','Confirm user / gateway change'));p.id='lifecycle-confirmation';
+      append(p,el('p',lifecycleAction(b.action)),el('p',b.tenant+' / '+b.principal),el('p',text('预期入口版本：','Expected gateway version: ')+b.expected_generation));
+      if(b.expires_at)append(p,el('h3',text('新 token 到期时间','New token expiry')),timeDetail(b.expires_at,true));
+      append(p,note(b.action==='create_user'?'只创建身份，不颁发 token，不授予工具权限，也不绑定服务凭据。':b.action==='revoke_entry'?'撤销后当前入口 token 立即失效。':'新秘密仅成功后展示一次。轮换会使旧入口 token 失效；不会增加工具权限。',b.action==='create_user'?'Creates only an identity: no token, tool grants or provider credentials.':b.action==='revoke_entry'?'The current gateway token stops working after revocation.':'The new secret is shown only after success. Rotation invalidates the old gateway token and does not grant tool access.'),el('p',text('预览确认截止：','Preview confirmation deadline: ')),timeDetail(preview.expires),
+        button(text('确认用户 / 入口变更','Confirm user / gateway change'),()=>lifecycle(b,preview.confirmationID),'danger',state.busy),
+        button(text('取消入口变更','Cancel gateway change'),()=>{state.lifecyclePreview=null;state.viewRevision++;render();},'',state.busy));
+      c.appendChild(p);
+    }
+    function renderEntrySecret(c) {
+      const secret=state.entrySecret;if(!secret)return;
+      const p=panel(text('入口 token · 仅本次展示','Gateway token · One-time display'));
+      p.id='entry-secret';
+      append(p,el('p',secret.tenant+' / '+secret.principal),note('这是用户网关凭证，不是管理员 token。请通过受信私密通道交付；不要粘贴到聊天、日志或 URL。切页、切换身份、刷新、离开或断开后清除，无法再次读取。','This is a user gateway credential, not an administrator token. Deliver through a trusted private channel, not chat, logs or URLs. Cleared on navigation, identity change, refresh, leaving or disconnect; it cannot be read again.'),el('pre',secret.token,'break-word'),timeDetail(secret.expires_at,true),button(text('已妥善保存，清除显示','Saved securely; clear display'),()=>{state.entrySecret=null;render();}));
+      c.appendChild(p);
+    }
     function renderUsers(c) {
+      renderEntrySecret(c);
+      const create=panel(text('创建用户','Create user'),text('明确填写租户和身份；新用户没有工具权限，也不会自动获得入口 token。','Specify tenant and principal. New users have no tool access and receive no token automatically.'));
+      const tenant=lifecycleField(create,'new-tenant','租户（tenant）','Tenant'),principal=lifecycleField(create,'new-principal','身份（principal）','Principal');
+      append(create,button(text('预览创建用户','Preview user creation'),()=> {
+        if(!tenant.value.trim()||!principal.value.trim()) {notify('请明确填写 tenant 和 principal。','Enter an explicit tenant and principal.',true);return;}
+        lifecycle({action:'create_user',tenant:tenant.value.trim(),principal:principal.value.trim(),expected_generation:0});
+      },'primary',state.busy||!capability('user_create')));
+      if(!capability('user_create'))create.appendChild(note('当前后端未开放用户创建；需要受支持的持久模式。','User creation is unavailable; supported persistent storage is required.'));
+      c.appendChild(create);
       const p=panel(text('身份与入口凭证','Identity & gateway credential'));
-      const u=userPicker(p);c.appendChild(p);if(!u)return;
+      const u=userPicker(p);c.appendChild(p);if(!u){lifecycleConfirmation(c);return;}
       const entry=u.entry;
       const expired=entry?.expires_at&&!entry.expires_at.startsWith('0001-')&&new Date(entry.expires_at).getTime()<=Date.now();
       const entryState=!entry?text('未提供入口信息','Entry information unavailable'):entry.revoked?text('已撤销','Revoked'):expired?text('已到期','Expired'):text('未撤销；完整可用性未确认','Not revoked; full usability unconfirmed');
       append(p,table([text('租户 / 身份','Tenant / identity'),text('身份状态','Identity state'),text('入口凭证版本','Gateway credential version'),text('入口凭证状态','Gateway credential state'),text('到期时间','Expiry')],
         [[u.tenant+' / '+u.principal,badge(u.disabled?text('已禁用','Disabled'):text('允许使用网关（仍需通过认证与授权）','Enabled (authentication and authorization still required)'),u.disabled?'bad':''),entry?.generation??'—',entryState,timeDetail(entry?.expires_at,true)]]),
-        help(text('如何颁发或替换入口凭证？','How do I issue or rotate gateway credentials?'),text('使用受信离线维护流程。此管理台不显示或生成入口秘密；新增用户仍需要拓扑迁移支持。','Use trusted offline maintenance. This console does not display or generate entry secrets; new users require topology migration support.')));
+        help(text('如何颁发或替换入口凭证？','How do I issue or rotate gateway credentials?'),text('下方操作先预览再确认。入口 token 不增加工具权限；管理员 token 与服务凭据是独立秘密。','Preview and confirm below. Gateway tokens never add tool access; administrator tokens and provider credentials are separate secrets.')));
+      const life=panel(text('入口 token 管理','Gateway token management'));
+      const expiry=lifecycleField(life,'entry-expiry','到期时间（UTC，例如 2026-12-31T23:59:59Z）','Expiry (UTC, e.g. 2026-12-31T23:59:59Z)');
+      const disabled=state.busy||u.disabled||!entry||!Number.isSafeInteger(entry.generation)||!capability('entry_lifecycle');
+      function entryOperation(action) {
+        const body={action,tenant:u.tenant,principal:u.principal,expected_generation:entry.generation};
+        if(action!=='revoke_entry') {
+          const value=expiry.value.trim(),date=new Date(value);
+          if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)||Number.isNaN(date.getTime())||date.toISOString().replace('.000Z','Z')!==value||date.getTime()<=Date.now()) {
+            notify('请输入未来的 UTC 到期时间，格式 YYYY-MM-DDTHH:mm:ssZ。','Enter a future UTC expiry in YYYY-MM-DDTHH:mm:ssZ format.',true);return;
+          }
+          body.expires_at=value;
+        }
+        lifecycle(body);
+      }
+      append(life,button(text('预览颁发入口 token','Preview token issuance'),()=>entryOperation('issue_entry'),'primary',disabled||!entry?.revoked),button(text('预览轮换入口 token','Preview token rotation'),()=>entryOperation('rotate_entry'),'',disabled||entry?.revoked),button(text('预览撤销入口 token','Preview token revocation'),()=>entryOperation('revoke_entry'),'danger',disabled||entry?.revoked));
+      if(!capability('entry_lifecycle'))life.appendChild(note('当前后端未开放入口生命周期操作。','Gateway lifecycle operations are unavailable in this backend.'));
+      if(entry&&!Number.isSafeInteger(entry.generation))life.appendChild(note('入口版本超出此客户端可安全表示的范围，已阻止操作。','The gateway version cannot be represented safely by this client; operations are blocked.'));
+      if(u.disabled)life.appendChild(note('此身份已禁用，不能管理入口 token。','This identity is disabled; gateway token management is blocked.'));
+      c.appendChild(life);lifecycleConfirmation(c);
       const b=panel(text('服务凭据绑定','Provider credential bindings'),text('仅显示元数据。凭据已保存不等于认证有效，目录也不是实时健康检查。','Metadata only. Stored credentials do not prove authentication; catalogs are not live health checks.'));
       if(!u.bindings?.length)empty(b,'尚无绑定记录。可显式启用本机 CLI 合成绑定；原生客户端集成尚未验证。','No binding records. Opt-in local CLI synthetic binding is available; native client integration is unverified.');
       else b.appendChild(table([text('服务','Service'),text('凭据状态','Credential state'),text('凭证版本','Credential version'),text('到期','Expires'),text('已发现工具','Discovered tools')],u.bindings.map(x=>[x.system,bindingState(x.state),x.generation,timeDetail(x.expires_at,true),(u.tools||[]).filter(t=>t.system===x.system).length])));
@@ -822,12 +931,94 @@
         'Summary unavailable.');
       c.appendChild(q);
     }
+    function invalidateConfigPreview() {
+      state.viewRevision++;state.draftApplied=false;state.configPreview=null;$('config-confirmation')?.remove();
+      if($('config-draft-heading'))$('config-draft-heading').textContent=text('生成并校验配置草稿 · 未应用','Generate and validate configuration draft · Not applied');
+    }
+    async function loadRegistry(resetDraft) {
+      if(state.busy)return;
+      const epoch=state.epoch,revision=state.viewRevision;
+      state.configPreview=null;setBusy(true);
+      try {
+        const result=await request('config/current');
+        if(!Array.isArray(result.systems)||!Number.isSafeInteger(result.revision)||typeof result.digest!=='string')throw {code:'invalid_response'};
+        if(state.page!=='config'||revision!==state.viewRevision)return;
+        state.registry=result;
+        if(resetDraft) {state.draft=JSON.stringify(result.systems,null,2);state.draftApplied=true;state.configForm={};}
+        const unknown=state.configUnknown;state.configUnknown=null;
+        if(unknown)notify(result.digest===unknown.candidate_digest?'已核对：当前运行配置摘要与目标一致。不要再次提交。配置生效不表示服务已连通。':'已读取当前运行版本与摘要。请核对差异；若仍需变更，必须重新预览，不要重放上次提交。',result.digest===unknown.candidate_digest?'Verified: the running digest matches the intended configuration. Do not resubmit. Applied configuration does not prove connectivity.':'Current revision and digest loaded. Review differences; preview again if a change is still needed. Never replay the previous submission.');
+        else notify('已读取运行服务配置；启动 seed JSON 不代表当前运行注册表。','Running service configuration loaded. Startup seed JSON is not the current running registry.');
+      }catch(e){showError(e);}finally{if(epoch===state.epoch)setBusy(false);}
+    }
+    async function previewConfig(systems) {
+      if(state.busy||!state.registry?.apply_supported||state.configUnknown)return;
+      const epoch=state.epoch,revision=state.viewRevision,expected_revision=state.registry.revision;
+      state.configPreview=null;setBusy(true);
+      try {
+        const result=await request('config/preview',{expected_revision,systems});
+        if(result.preview!==true||!result.confirmation_id||!result.candidate_digest)throw {code:'invalid_response'};
+        if(state.page==='config'&&revision===state.viewRevision) {
+          state.configPreview={...result,expected_revision,systems};
+          notify('应用预览已通过，尚未生效。请核对新增服务、超时更新与版本后确认。','Apply preview passed; nothing is active yet. Review added services, timeout updates and revision before confirming.');
+        }
+      }catch(e){configError(e,false);}finally{if(epoch===state.epoch)setBusy(false);}
+    }
+    function configError(e,write) {
+      if(e.stale)return;
+      if(e.status===409) {
+        state.registry=null;
+        notify('配置版本或确认票据已变化，未应用此修改。请先核对运行版本与摘要，再重新预览。','Configuration revision or confirmation ticket changed; this change was not applied. Check the running revision and digest, then preview again.',true);
+      }else if(e.code==='unsupported_destructive_change')notify('此阶段仅支持新增服务或调整 timeouts。不能删除服务，也不能修改已有服务的端点、认证、网络或配额；未应用此草稿。','This stage supports only service additions or timeout updates. Existing endpoint, authentication, network, quota changes and deletion are blocked; this draft was not applied.',true);
+      else showError(e,write);
+    }
+    async function applyConfig(preview) {
+      if(state.busy||state.configPreview!==preview)return;
+      const epoch=state.epoch,revision=state.viewRevision;
+      state.configPreview=null;setBusy(true);let committed=false;
+      try {
+        const result=await request('config/apply',{expected_revision:preview.expected_revision,systems:preview.systems,candidate_digest:preview.candidate_digest,confirmation_id:preview.confirmation_id});
+        if(result.applied!==true||!Number.isSafeInteger(result.revision)||typeof result.digest!=='string'||!Array.isArray(result.systems))throw {code:'invalid_response'};
+        committed=true;state.configUnknown=null;
+        state.registry={...state.registry,...result};
+        if(state.page==='config'&&revision===state.viewRevision) {state.draft=JSON.stringify(result.systems,null,2);state.draftApplied=true;}
+        state.snapshot=await request('snapshot');
+        notify('服务配置已应用，状态已刷新。尚未验证连通性或服务认证；用户仍需独立授权、绑定凭据并发现工具。','Service configuration applied and state refreshed. Connectivity and provider authentication are unverified; users still need separate grants, credential bindings and tool discovery.');
+      }catch(e) {
+        if(committed&&!e.stale&&e.status!==401)notify('服务配置已应用，但状态刷新失败。请核对运行版本，不要再次提交；连通性尚未验证。','Service configuration applied, but state refresh failed. Check the running revision; do not resubmit. Connectivity remains unverified.',true);
+        else if(!e.stale&&e.status!==401) {
+          if(e.status===409||e.status===400)configError(e,false);
+          else {
+            state.configUnknown={candidate_digest:preview.candidate_digest,expected_revision:preview.expected_revision};
+            notify('配置应用结果未知，不要重复提交。请点击“核对运行版本与摘要”，读取服务端权威状态后再决定；不会自动重放。','Configuration apply outcome unknown. Do not resubmit. Check the running revision and digest before deciding; no automatic replay.',true);
+          }
+        }else showError(e,true);
+      }finally{if(epoch===state.epoch)setBusy(false);}
+    }
+    function renderConfigApplication(c, area) {
+      const p=panel(text('受控应用服务配置','Apply supported service changes'),text('仅支持新增服务与 timeouts 更新。已有服务的删除、端点、认证、网络与配额变更不支持。应用不测试连接，不自动授权或发现工具。','Only service additions and timeout updates are supported. Deleting services or changing existing endpoints, auth, network or quota is blocked. Applying does not test connectivity, grant access or discover tools.'));
+      append(p,button(text('读取运行配置并重置草稿','Load running configuration and reset draft'),()=>loadRegistry(true),'',state.busy),button(text('核对运行版本与摘要','Check running revision and digest'),()=>loadRegistry(false),'',state.busy),note('读取并重置会替换本地草稿。运行注册表与启动 seed JSON 分离；不要将此服务数组直接覆盖启动配置或重新初始化数据库。','Loading and resetting replaces the local draft. The running registry is separate from startup seed JSON; never overwrite startup configuration with this service array or reinitialize the database.'));
+      const r=state.registry;
+      if(r)append(p,el('p',text('运行版本：','Running revision: ')+r.revision),el('p',text('运行摘要：','Running digest: ')+r.digest,'break-word'));
+      if(!r)append(p,note('应用前请先读取运行配置，取得权威版本。','Read the running configuration before previewing an application.'));
+      else if(!r.apply_supported)append(p,note('此后端不支持在线应用；需要受支持的持久模式。静态校验仍不应用配置。','Online apply is unavailable; supported persistent storage is required. Static validation never applies configuration.'));
+      if(state.configUnknown)append(p,note('上次应用结果未知，已阻止再次预览。先核对服务端版本与摘要。','The last apply outcome is unknown. Further preview is blocked until the server revision and digest are checked.'));
+      append(p,button(text('预览服务配置应用','Preview service configuration apply'),()=> {
+        let systems;try {systems=JSON.parse(area.value);if(!Array.isArray(systems))throw Error();}catch {notify('请输入合法的服务配置 JSON 数组。','Enter a valid service configuration JSON array.',true);return;}
+        state.draft=area.value;previewConfig(systems);
+      },'primary',state.busy||!r?.apply_supported||!!state.configUnknown));
+      c.appendChild(p);
+      const preview=state.configPreview;if(!preview)return;
+      const confirm=panel(text('确认应用服务配置','Confirm service configuration apply'));confirm.id='config-confirmation';
+      append(confirm,el('p',text('预期运行版本：','Expected running revision: ')+preview.expected_revision),el('p',text('目标摘要：','Candidate digest: ')+preview.candidate_digest,'break-word'),el('p',text('新增服务：','Added services: ')+(preview.added||[]).join(', ')),el('p',text('超时更新：','Timeout updates: ')+(preview.updated||[]).join(', ')),el('p',text('确认截止：','Confirmation deadline: ')),timeDetail(preview.confirmation_expires_at),append(el('details'),el('summary',text('检查完整目标配置','Inspect full candidate configuration')),el('pre',JSON.stringify(preview.systems,null,2))),note('确认将更新运行服务注册表。不会证明服务在线，不会颁发用户 token，也不会授予工具权限。','Confirmation updates the running service registry. It does not prove availability, issue user tokens or grant tool access.'),button(text('确认应用服务配置','Confirm service configuration apply'),()=>applyConfig(preview),'danger',state.busy),button(text('取消配置应用','Cancel configuration apply'),()=>{state.viewRevision++;state.configPreview=null;render();},'',state.busy));
+      c.appendChild(confirm);
+    }
     // The structured form builds a local draft. Validation deliberately cannot apply or restart.
     function renderConfig(c) {
-      const p=panel(text('生成并校验配置草稿 · 未应用',
+      const p=panel(state.draftApplied?text('运行配置副本 · 编辑后需重新应用','Running configuration copy · Edits require application'):text('生成并校验配置草稿 · 未应用',
           'Generate and validate configuration draft · Not applied'),
-        text('从当前配置生成本地草稿。此页不能在线接入、保存生效或重启；静态校验只检查格式与规则。不能包含 token 或凭据，草稿仅在页面内存保留。',
-          'Prepare a local draft from running configuration. This page cannot connect, apply or restart; validation checks static rules only. No tokens or credentials. Page memory only.'));
+        text('草稿仅在页面内存保留，不能包含 token 或凭据。静态校验只检查格式与规则；若要实际应用，请先读取运行配置，再使用下方独立的预览与确认流程。',
+          'Drafts stay in page memory and must not contain tokens or credentials. Static validation checks rules only. To apply changes, read the running configuration and use the separate preview and confirmation flow below.'));
+      p.children[0].id='config-draft-heading';
       const fields=el('div',
         undefined,
         'fields');
@@ -939,7 +1130,7 @@
       area.disabled=state.busy;
       area.addEventListener('input',
         ()=> {
-          state.draft=area.value
+          state.draft=area.value;invalidateConfigPreview();
       });
       append(advanced,
         label,
@@ -964,8 +1155,8 @@
             {
               systems
           });
-          if(r.valid&&r.applied===false)notify('静态校验通过，未应用。拓扑变更需要迁移支持；不要直接覆盖运行配置或重新初始化数据库。',
-            'Static validation passed; NOT APPLIED. Topology changes require migration support. Do not overwrite running configuration or reinitialize the database.');
+          if(r.valid&&r.applied===false)notify('静态校验通过，未应用。实际应用必须走独立预览与确认；不要覆盖启动配置或重新初始化数据库。',
+            'Static validation passed; NOT APPLIED. Application requires separate preview and confirmation. Never overwrite startup configuration or reinitialize the database.');
           else notify('后端未确认草稿有效，未声明应用成功。',
             'The backend did not confirm draft validity; no application is claimed.',
             true);
@@ -1014,6 +1205,7 @@
             };
             if(quota.value.trim())service.quota_subject=quota.value.trim();
             systems.push(service);
+            invalidateConfigPreview();
             state.draft=JSON.stringify(systems,
               null,
               2);
@@ -1031,12 +1223,13 @@
           validate,
           'primary',
           state.busy||!capability('config_validate')),
-        note('校验成功不表示端点可用、凭据有效或持久存储能重新打开。这里没有“保存并生效”。',
-          'Validation does not prove endpoint availability, credential validity or storage reopenability. There is no “save and activate” here.'));
+        note('校验成功不表示端点可用、凭据有效或配置已生效。校验与实际应用是独立操作。',
+          'Validation does not prove endpoint availability, credential validity or application. Validation and application are separate operations.'));
       c.appendChild(p);
+      renderConfigApplication(c,area);
       const maintenance=panel(text('应用与维护边界',
           'Application & maintenance boundaries'));
-      maintenance.appendChild(help(text('如何应用配置或重启？','How do I apply configuration or restart?'),text('当前没有受控应用执行器与拓扑迁移，不能在线应用此草稿。入口替换/撤销、根密钥轮换和审计归档使用受信离线流程。不要覆盖数据库或重新初始化绕过迁移。','There is no controlled apply executor or topology migration; this draft cannot be applied online. Use trusted offline workflows for entry lifecycle, root-key rotation and audit archival. Never overwrite or reinitialize the database to bypass migration.')));
+      maintenance.appendChild(help(text('如何应用配置或重启？','How do I apply configuration or restart?'),text('在线应用仅支持新增服务与超时调整，不包含重启或破坏性变更。入口 token 请到用户页面管理；根密钥轮换和审计归档使用受信离线流程。不要覆盖数据库或重新初始化绕过迁移。','Online apply supports additions and timeout updates only, not restarts or destructive changes. Manage gateway tokens on the Users page. Use trusted offline workflows for root-key rotation and audit archival. Never overwrite or reinitialize the database to bypass migration.')));
       c.appendChild(maintenance);
     }
     $('login-form').addEventListener('submit',
@@ -1059,6 +1252,7 @@
         state.lang=$('language').value==='en'?'en':'zh-CN';
         render()
     });
+    window.addEventListener('offline', disconnect);
     window.addEventListener('pagehide',
       disconnect);
     render();

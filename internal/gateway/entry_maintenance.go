@@ -61,6 +61,9 @@ func (g *Gateway) mutateEntry(identity Identity, expected uint64, digest *[32]by
 		return EntryInfo{}, ErrConflict
 	}
 	if digest != nil {
+		if g.adminAuthorities[*digest] {
+			return EntryInfo{}, ErrDenied
+		}
 		for _, old := range g.entryTokens {
 			if old == *digest {
 				return EntryInfo{}, ErrDenied
@@ -109,7 +112,7 @@ func (g *Gateway) mutateEntry(identity Identity, expected uint64, digest *[32]by
 	return candidate.entry, nil
 }
 
-// persistEntry 由持有 g.mu 的维护路径调用，将身份记录、审计事件及状态 MAC
+// persistEntry 由持有 g.mu 的在线管理或离线维护路径调用，将身份记录、审计事件及状态 MAC
 // 放在同一事务中；提交失败交由调用方关闭实例，不能继续使用旧视图猜测结果。
 func (s *sqliteStore) persistEntry(g *Gateway, id string, r storedPrincipal, event AuditEvent) error {
 	next := make(map[string]storedPrincipal, len(s.records))
@@ -124,7 +127,9 @@ func (s *sqliteStore) persistEntry(g *Gateway, id string, r storedPrincipal, eve
 		return err
 	}
 	defer tx.Rollback()
-	if err = writePrincipal(ctx, tx, r, false); err != nil {
+	// 在线 create_user 使用插入，其余入口变更使用更新；二者共用审计与 MAC 事务。
+	_, exists := s.records[id]
+	if err = writePrincipal(ctx, tx, r, !exists); err != nil {
 		return err
 	}
 	seq, head, err := s.writeAudit(ctx, tx, event)

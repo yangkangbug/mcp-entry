@@ -20,9 +20,10 @@ type IngressConfig struct {
 	Principal AdmissionLimit `json:"principal,omitempty"`
 }
 type ingressLimiter struct {
-	mu         sync.Mutex
-	global     admissionBucket
-	principals map[Identity]*admissionBucket
+	principalLimit AdmissionLimit
+	mu             sync.Mutex
+	global         admissionBucket
+	principals     map[Identity]*admissionBucket
 }
 
 func newIngressLimiter(cfg IngressConfig, identities []Identity) (*ingressLimiter, error) {
@@ -35,11 +36,26 @@ func newIngressLimiter(cfg IngressConfig, identities []Identity) (*ingressLimite
 		return nil, err
 	}
 	now := time.Now()
-	l := &ingressLimiter{global: admissionBucket{limit: global, tokens: float64(global.Burst), last: now}, principals: make(map[Identity]*admissionBucket, len(identities))}
+	l := &ingressLimiter{principalLimit: principal, global: admissionBucket{limit: global, tokens: float64(global.Burst), last: now}, principals: make(map[Identity]*admissionBucket, len(identities))}
 	for _, id := range identities {
 		l.principals[id] = &admissionBucket{limit: principal, tokens: float64(principal.Burst), last: now}
 	}
 	return l, nil
+}
+
+// addIdentity 只接受已提交的 managed 身份或已认证的恢复记录，由 limiter 锁保护。
+// 仅补缺失桶，不重置旧桶的速率余额及在途计数；入口请求本身不创建身份桶。
+func (l *ingressLimiter) addIdentity(id Identity) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.principals[id] == nil {
+		l.principals[id] = &admissionBucket{limit: l.principalLimit, tokens: float64(l.principalLimit.Burst), last: time.Now()}
+	}
+}
+func (l *ingressLimiter) principalBucket(id Identity) *admissionBucket {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.principals[id]
 }
 
 // acquire 仅结算一个入口桶；与出站多桶原子准入不同，全局与身份桶分步扣费。
@@ -113,7 +129,7 @@ func (g *Gateway) GuardHTTP(next http.Handler) http.Handler {
 		}
 		// 未认证请求只计入全局桶，不按任意输入创建桶；真正的认证由路由执行。
 		if identity, valid := g.authenticateEntry(r); valid {
-			releasePrincipal, admitted := g.ingress.acquire(g.ingress.principals[identity])
+			releasePrincipal, admitted := g.ingress.acquire(g.ingress.principalBucket(identity))
 			if !admitted {
 				g.rejections.record(RejectionIngressPrincipal)
 				http.Error(w, "request capacity exceeded", http.StatusTooManyRequests)

@@ -23,7 +23,7 @@ var adminAssets embed.FS
 
 // AdminHandler is a separately authorized, opt-in loopback control surface.
 // token is supplied by the operator, never derived from entry identity or roles.
-// Configuration drafts are stateless and never change the live topology.
+// 配置草稿不改运行状态；运行配置应用另走 revision CAS 与一次性预览确认票据。
 // 此入口是单一管理员权限，不区分持有同一 token 的自然人；变更记为 operator。
 // 宿主仍须提供入口总限额、读取截止和原始 HTTP 头限制，不能只依赖这里的槽位。
 func (g *Gateway) AdminHandler(origin, token string) (http.Handler, error) {
@@ -49,7 +49,15 @@ func (g *Gateway) AdminHandler(origin, token string) (http.Handler, error) {
 			return nil, errors.New("admin authority must be separate")
 		}
 	}
+	if g.adminAuthorities == nil {
+		g.adminAuthorities = map[[32]byte]bool{}
+	}
+	g.adminAuthorities[digest] = true
 	g.mu.Unlock()
+	// 两类票据按 handler 隔离且不持久化；具体操作均在 g.mu 内访问，
+	// handler 重建或进程重启后旧票据失效，不提供结果未知时的自动重放。
+	confirmations := map[string]lifecycleConfirmation{}
+	configConfirmations := map[string]runtimeConfigConfirmation{}
 	// 额外的四槽零队列限制只属于此 handler 实例，覆盖静态资源和 API；
 	// 它不是按管理员身份隔离的配额，也不能替代宿主入口防护。
 	slots := make(chan struct{}, 4)
@@ -122,6 +130,12 @@ func (g *Gateway) AdminHandler(origin, token string) (http.Handler, error) {
 				return
 			}
 			accountJSON(w, 200, value)
+		case "/admin/api/lifecycle":
+			var in lifecycleRequest
+			if !adminDecode(w, r, &in) {
+				return
+			}
+			g.adminLifecycle(w, in, confirmations)
 		case "/admin/api/mutate":
 			var in adminMutation
 			if !adminDecode(w, r, &in) {
@@ -154,6 +168,18 @@ func (g *Gateway) AdminHandler(origin, token string) (http.Handler, error) {
 				return
 			}
 			accountJSON(w, 200, page)
+		case "/admin/api/config/current":
+			if r.Method != http.MethodGet {
+				accountError(w, 405, "method_not_allowed")
+				return
+			}
+			g.adminCurrentConfig(w)
+		case "/admin/api/config/preview", "/admin/api/config/apply":
+			var in runtimeConfigRequest
+			if !adminDecode(w, r, &in) {
+				return
+			}
+			g.adminRuntimeConfig(w, in, r.URL.Path == "/admin/api/config/apply", configConfirmations)
 		case "/admin/api/config/validate":
 			var in struct {
 				Systems []System `json:"systems"`
@@ -397,6 +423,7 @@ func (g *Gateway) adminSnapshot() (any, error) {
 		return users[i].Principal < users[j].Principal
 	})
 	persistent := g.store != nil
+	lifecycle := persistent && !g.maintenance
 	g.mu.Unlock()
-	return map[string]any{"capabilities": map[string]bool{"policy_update": true, "principal_disable": true, "binding_revoke": true, "entry_lifecycle": false, "user_create": false, "topology_apply": false, "config_validate": true}, "limitations": map[string]string{"entry_lifecycle": "offline_only", "user_create": "topology_migration_required", "topology_apply": "topology_migration_required"}, "persistent": persistent, "services": services, "users": users, "audit": g.AuditStatus(), "rejections": g.RejectionStatus(), "metrics": map[string]any{"latency_p95": nil, "success_rate": nil}}, nil
+	return map[string]any{"capabilities": map[string]bool{"policy_update": true, "principal_disable": true, "binding_revoke": true, "entry_lifecycle": lifecycle, "user_create": lifecycle, "topology_apply": lifecycle, "config_validate": true}, "limitations": map[string]string{"topology_apply": "add_and_timeouts_only_persistent"}, "persistent": persistent, "services": services, "users": users, "audit": g.AuditStatus(), "rejections": g.RejectionStatus(), "metrics": map[string]any{"latency_p95": nil, "success_rate": nil}}, nil
 }

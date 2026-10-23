@@ -11,6 +11,27 @@ import (
 
 type discoveryKey struct{ user, system string }
 
+// entryRevision 保存 HTTP 认证时捕获的入口代次；后续读写及最终准入须重新核对，
+// 防止解析请求期间发生 token 轮换/撤销后仍沿用旧认证。无此上下文的可信
+// 进程内调用仍遵守原有权限契约，不能由外部请求自行选择该路径。
+type entryRevisionKey struct{}
+type entryRevision struct {
+	Identity   Identity
+	Generation uint64
+}
+
+func withEntryRevision(ctx context.Context, identity Identity, generation uint64) context.Context {
+	return context.WithValue(ctx, entryRevisionKey{}, entryRevision{identity, generation})
+}
+func (g *Gateway) entryRevisionAllowedLocked(ctx context.Context, id string) bool {
+	revision, ok := ctx.Value(entryRevisionKey{}).(entryRevision)
+	if !ok {
+		return true
+	}
+	p := g.principals[id]
+	return p != nil && p.identity == revision.Identity && p.entry.Generation == revision.Generation && g.principalUsableLocked(id)
+}
+
 func bindingUsable(b *bindingRecord) bool {
 	return b.info.State == BindingActive && b.credential != "" && (b.info.ExpiresAt.IsZero() || time.Now().Before(b.info.ExpiresAt))
 }
@@ -53,6 +74,9 @@ func (g *Gateway) validateAccountAuth() error {
 		return ErrDenied
 	}
 	for id, user := range g.users {
+		if g.principals[id].entry.Revoked {
+			continue
+		}
 		if !g.entryStrong[id] || user.TokenExpiresAt.IsZero() {
 			return errors.New("account access requires strong finite entry credentials")
 		}
@@ -63,13 +87,16 @@ func (g *Gateway) validateAccountAuth() error {
 // AccountBindings exposes only this configured identity's binding metadata.
 // Identity 仍须由调用方从已认证请求取得；本方法检查可用性但不证明来访者身份。
 func (g *Gateway) AccountBindings(identity Identity) ([]BindingInfo, error) {
+	return g.accountBindings(context.Background(), identity)
+}
+func (g *Gateway) accountBindings(ctx context.Context, identity Identity) ([]BindingInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	id, p, err := g.principalLocked(identity)
 	if err != nil {
 		return nil, err
 	}
-	if !g.principalUsableLocked(id) {
+	if !g.principalUsableLocked(id) || !g.entryRevisionAllowedLocked(ctx, id) {
 		return nil, ErrDenied
 	}
 	result := []BindingInfo{}
@@ -105,6 +132,10 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 	if err := ctx.Err(); err != nil {
 		g.mu.Unlock()
 		return discoveryFailure(id, system, "discovery canceled", classifyDownstreamFailure(ctx, FailureDiscovery, err, false))
+	}
+	if !g.entryRevisionAllowedLocked(ctx, id) {
+		g.mu.Unlock()
+		return discoveryFailure(id, system, "entry revision unavailable", ErrDenied)
 	}
 	if !g.principalUsableLocked(id) {
 		g.invalidateLocked(id, system)
@@ -142,6 +173,7 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 	}
 	// 抓取同一锁内的授权版本与凭据供本次发现使用，锁外网络结果不能直接发布。
 	generation, version, token := b.info.Generation, p.version, b.credential
+	entryGeneration := p.entry.Generation
 	key := discoveryKey{id, system}
 	if previous, ok := g.operations[g.discoveryEpoch[key]]; ok {
 		previous.cancel()
@@ -161,8 +193,9 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 	cancel()
 	p = g.principals[id]
 	b = p.bindings[system]
-	// 即使取消未能阻止旧网络请求返回，epoch 和版本比较也阻止它覆盖新状态。
-	if g.discoveryEpoch[key] != opID || g.closed || b.info.Generation != generation || p.version != version {
+	// 即使取消未能阻止旧网络请求返回，epoch、入口/绑定/策略及运行服务版本
+	// 比较也会阻止旧发现覆盖新状态；服务同名不代表仍是同一运行配置。
+	if g.discoveryEpoch[key] != opID || g.closed || g.systems[system].revision != connection.revision || p.entry.Generation != entryGeneration || b.info.Generation != generation || p.version != version {
 		return discoveryFailure(id, system, "discovery superseded", nil)
 	}
 	// Replace only this system, preserving unrelated identities and connections.

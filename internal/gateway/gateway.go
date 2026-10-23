@@ -43,7 +43,7 @@ type snapshot struct {
 	handlers map[string]http.Handler
 }
 
-// Gateway 由固定拓扑、可变身份状态和只读目录快照组成。mu 串行化授权变更、
+// Gateway 由运行服务注册表、可变身份状态和只读目录快照组成。mu 串行化授权变更、
 // 最终准入及审计发布；网络 I/O 在锁外执行，完成后再检查版本是否仍可发布。
 type Gateway struct {
 	clientBindingEnabled    atomic.Bool
@@ -62,6 +62,7 @@ type Gateway struct {
 	auditFault              bool
 	closed                  bool
 	store                   *sqliteStore
+	adminAuthorities        map[[32]byte]bool
 	entryTokens             map[string][32]byte
 	entryStrong             map[string]bool
 	discoveryEpoch          map[discoveryKey]uint64
@@ -218,19 +219,23 @@ func (g *Gateway) Names(id string) []string {
 func (g *Gateway) Refresh(ctx context.Context) []DiscoveryIssue {
 	g.refreshMu.Lock()
 	defer g.refreshMu.Unlock()
+	g.mu.Lock()
+	users := make(map[string]User, len(g.users))
 	ids := make([]string, 0, len(g.users))
-	for id := range g.users {
+	for id, user := range g.users {
 		ids = append(ids, id)
+		users[id] = user
 	}
-	sort.Strings(ids)
 	systems := make([]string, 0, len(g.systems))
 	for name := range g.systems {
 		systems = append(systems, name)
 	}
+	g.mu.Unlock()
+	sort.Strings(ids)
 	sort.Strings(systems)
 	issues := []DiscoveryIssue{}
 	for _, id := range ids {
-		user := g.users[id]
+		user := users[id]
 		for _, system := range systems {
 			issues = append(issues, g.RefreshBinding(ctx, Identity{user.Tenant, user.Principal}, system)...)
 		}
@@ -549,6 +554,7 @@ func validateSchemaTypes(value any) error {
 func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *mcp.CallToolResult, retErr error) {
 	g.mu.Lock()
 	e, exists := g.evaluateLocked(id, name)
+	exists = exists && g.entryRevisionAllowedLocked(ctx, id)
 	g.mu.Unlock()
 	if !exists {
 		g.rejectOperation(ctx, RejectionOperationAuthorization)
@@ -587,8 +593,10 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 	// Final dispatch admission and revocation share this lock. A request admitted
 	// first is in flight even if its first network byte is sent later.
 	g.mu.Lock()
+	// 同时核对认证入口代次、发现目录版本及 handler 捕获的运行服务 revision；
+	// 配置更新后即使重新发布同名工具，也不能让旧请求穿越版本边界。
 	current, ok := g.evaluateLocked(id, name)
-	if !ok || current.tool != e.tool || current.generation != e.generation || current.policyVersion != e.policyVersion {
+	if !ok || !g.entryRevisionAllowedLocked(ctx, id) || current.tool != e.tool || current.generation != e.generation || current.policyVersion != e.policyVersion || current.system.revision != e.system.revision || !runtimeServiceRevisionAllowed(ctx, current.system) {
 		g.mu.Unlock()
 		g.rejectOperation(ctx, RejectionOperationAuthorization)
 		return nil, ErrDenied
@@ -645,10 +653,12 @@ func (g *Gateway) makeSnapshot(catalogs map[string]map[string]entry) *snapshot {
 // toolHandler 将身份绑定在服务端闭包中。业务工具走 Call 的独立准入，
 // 本地连接状态工具只读获准服务元数据，不沿业务下游转发路径执行。
 func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler {
+	generation := g.principals[id].entry.Generation
 	server := mcp.NewServer(&mcp.Implementation{Name: "mcp-entry", Version: "0.2.0-demo"}, nil)
 	g.addClientBindingTool(server, id)
 	for name, e := range catalog {
 		server.AddTool(e.tool, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			ctx = context.WithValue(ctx, runtimeServiceRevisionKey{}, runtimeServiceRevision{e.system.Name, e.system.revision})
 			result, err := g.Call(ctx, id, name, req.Params.Arguments)
 			if err != nil {
 				result = &mcp.CallToolResult{}
@@ -661,6 +671,14 @@ func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler 
 	// catalog revision. It can never expose an old binding's schema as a new one.
 	server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			g.mu.Lock()
+			p := g.principals[id]
+			valid := p != nil && p.entry.Generation == generation && g.principalUsableLocked(id) && g.entryRevisionAllowedLocked(ctx, id)
+			g.mu.Unlock()
+			if !valid {
+				return nil, ErrDenied
+			}
+			ctx = withEntryRevision(ctx, p.identity, generation)
 			ctx = context.WithValue(ctx, operationRejectionKey{}, &operationRejection{})
 			result, err := next(ctx, method, req)
 			if err != nil {
@@ -675,6 +693,9 @@ func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler 
 			}
 			g.mu.Lock()
 			defer g.mu.Unlock()
+			if !g.entryRevisionAllowedLocked(ctx, id) {
+				return nil, ErrDenied
+			}
 			filtered := make([]*mcp.Tool, 0, len(list.Tools))
 			for _, tool := range list.Tools {
 				if tool.Name == clientConnectionsTool && g.clientBindingEnabled.Load() && g.principalUsableLocked(id) {
@@ -703,12 +724,13 @@ func (g *Gateway) Handler() http.Handler {
 			http.Error(w, "browser access disabled", http.StatusForbidden)
 			return
 		}
-		identity, ok := g.authenticateEntry(r)
+		identity, generation, ok := g.authenticateClientEntry(r)
 		if ok {
+			r = r.WithContext(withEntryRevision(r.Context(), identity, generation))
 			g.mu.Lock()
 			id, p, err := g.principalLocked(identity)
 			var handler http.Handler
-			if err == nil && !p.disabled && g.principalUsableLocked(id) {
+			if err == nil && !p.disabled && g.principalUsableLocked(id) && g.entryRevisionAllowedLocked(r.Context(), id) {
 				handler = g.state.Load().handlers[id]
 			}
 			g.mu.Unlock()

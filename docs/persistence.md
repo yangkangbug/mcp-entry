@@ -1,5 +1,7 @@
 # 单实例持久化与恢复
 
+> 更新：持久管理端现支持[动态用户与入口凭据](managed-user-lifecycle.md)及[受控服务新增/超时应用](runtime-service-config.md)。运行注册表与原启动配置锚点有明确区别；不得用导出运行配置覆盖启动种子或重置数据库。
+
 这是可选的单实例原型，仅用于本地合成身份和虚构凭据。默认 New、cmd/demo 和 cmd/gateway 仍使用内存模式，cmd/gateway 可显式通过 -db 和 key 文件/标准输入启用持久化，步骤见 [本地预览](cli-preview.md)。没有 token 颁发接口、真实密钥配置或生产账户接入。
 
 ## 保存什么

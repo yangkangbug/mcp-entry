@@ -79,19 +79,20 @@ func (g *Gateway) AccountHandler(expectedOrigin string) (http.Handler, error) {
 			accountError(w, http.StatusNotFound, "not_found")
 			return
 		}
-		identity, ok := g.authenticateEntry(r)
+		identity, entryGeneration, ok := g.authenticateClientEntry(r)
 		if !ok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="mcp-entry"`)
 			accountError(w, http.StatusUnauthorized, "entry_authentication_rejected")
 			return
 		}
+		r = r.WithContext(withEntryRevision(r.Context(), identity, entryGeneration))
 		if r.URL.Path == "/account/api/bindings" {
 			if r.Method != http.MethodGet {
 				w.Header().Set("Allow", "GET")
 				accountError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 				return
 			}
-			bindings, err := g.AccountBindings(identity)
+			bindings, err := g.accountBindings(r.Context(), identity)
 			if err != nil {
 				accountFailure(w, err)
 				return
@@ -143,7 +144,7 @@ func (g *Gateway) AccountHandler(expectedOrigin string) (http.Handler, error) {
 				accountError(w, http.StatusBadRequest, "invalid_request")
 				return
 			}
-			info, err = g.revokeOwnBinding(identity, system, expected)
+			info, err = g.revokeBinding(identity, system, expected, true, entryGeneration)
 		} else {
 			for key := range fields {
 				if key != "expected_generation" && key != "credential" && key != "expires_at" {
@@ -169,7 +170,7 @@ func (g *Gateway) AccountHandler(expectedOrigin string) (http.Handler, error) {
 					return
 				}
 			}
-			info, err = g.replaceOwnBinding(identity, system, expected, credential, expires)
+			info, err = g.replaceBinding(identity, system, expected, credential, expires, true, entryGeneration)
 			credential = ""
 		}
 		if err != nil {
@@ -189,8 +190,11 @@ func (g *Gateway) AccountHandler(expectedOrigin string) (http.Handler, error) {
 			issues := g.RefreshBinding(ctx, identity, system)
 			cancel()
 			result.Hint = "Replacement saved. Discovery completed; tools remain subject to your policy."
+			g.mu.Lock()
+			userID := g.identities[identity]
+			g.mu.Unlock()
 			for _, issue := range issues {
-				if issue.User == g.identities[identity] && issue.System == system {
+				if issue.User == userID && issue.System == system {
 					result.Hint = "Replacement saved, but downstream discovery is unavailable. Check status and provider access before replacing again."
 					result.Failure = issue.Failure
 					if issue.Failure != nil {

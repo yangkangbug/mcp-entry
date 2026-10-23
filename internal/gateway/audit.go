@@ -35,6 +35,7 @@ const (
 	AuditActorEntry             AuditActor  = "entry"
 	AuditActorOperator          AuditActor  = "operator"
 	AuditActorGateway           AuditActor  = "gateway"
+	AuditActionConfigApply      AuditAction = "config_apply"
 	AuditActionDiscovery        AuditAction = "discovery"
 	AuditActionCall             AuditAction = "call"
 	AuditActionBindingReplace   AuditAction = "binding_replace"
@@ -44,6 +45,8 @@ const (
 	AuditActionStorageArchive   AuditAction = "storage_archive"
 	AuditActionStorageMigrate   AuditAction = "storage_migrate"
 	AuditActionStorageRotate    AuditAction = "storage_rotate"
+	AuditActionUserCreate       AuditAction = "user_create"
+	AuditActionEntryIssue       AuditAction = "entry_issue"
 	AuditActionEntryRotate      AuditAction = "entry_rotate"
 	AuditActionEntryRevoke      AuditAction = "entry_revoke"
 	AuditPhaseAdmission         AuditPhase  = "admission"
@@ -147,7 +150,7 @@ func ValidateAuditEvent(e AuditEvent) error {
 		if e.SystemID == "" {
 			return ErrAuditInvalid
 		}
-	case AuditActionStorageArchive, AuditActionStorageMigrate, AuditActionStorageRotate, AuditActionPolicyUpdate, AuditActionPrincipalDisable, AuditActionEntryRotate, AuditActionEntryRevoke:
+	case AuditActionConfigApply, AuditActionUserCreate, AuditActionEntryIssue, AuditActionStorageArchive, AuditActionStorageMigrate, AuditActionStorageRotate, AuditActionPolicyUpdate, AuditActionPrincipalDisable, AuditActionEntryRotate, AuditActionEntryRevoke:
 	default:
 		return ErrAuditInvalid
 	}

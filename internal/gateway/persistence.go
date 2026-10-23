@@ -59,6 +59,7 @@ type storedPrincipal struct {
 	Bindings                  []storedBinding
 }
 type sqliteStore struct {
+	runtimeConfig     *runtimeManifest
 	auditBaseSequence uint64
 	auditBaseHead     string
 	auditArchiveHash  string
@@ -76,6 +77,14 @@ type sqliteStore struct {
 	records           map[string]storedPrincipal
 }
 
+// managedUserID 为在线创建身份分配独立的确定性命名空间，不改认证后的 seed 拓扑。
+// ID 匹配仅是结构约束，不证明身份可信；managed 记录仍须通过完整状态 MAC。
+func managedUserID(identity Identity) string {
+	encoded, _ := json.Marshal(identity)
+	sum := sha256.Sum256(append([]byte("mcp-entry/managed-user/v1\x00"), encoded...))
+	return fmt.Sprintf("managed:%x", sum)
+}
+
 func entryTokenDigest(token string) [32]byte {
 	return sha256.Sum256([]byte("mcp-entry/entry-token/v1\x00" + token))
 }
@@ -84,7 +93,8 @@ func derivedKey(key []byte, purpose string) ([]byte, error) {
 }
 
 // NewPersistent keeps catalogs transient. Reopening never reimports policies or
-// credentials, and rejects topology changes instead of merging config.
+// credentials, and rejects bootstrap topology changes instead of merging config.
+// Authenticated managed identities are restored from the state records separately.
 func NewPersistent(cfg Config, opts PersistenceOptions) (*Gateway, error) {
 	if opts.Migrate {
 		return nil, ErrStorageVersion
@@ -282,7 +292,7 @@ func (s *sqliteStore) stateMACAt(records map[string]storedPrincipal, sequence ui
 	for _, id := range ids {
 		ordered = append(ordered, records[id])
 	}
-	encoded := s.canonicalState(ordered, sequence, head)
+	encoded := s.runtimeStateEncoding(s.canonicalState(ordered, sequence, head))
 	m := hmac.New(sha256.New, s.macKey)
 	m.Write(encoded)
 	return m.Sum(nil)
@@ -362,6 +372,9 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 	if err != nil || string(plain) != fmt.Sprintf("mcp-entry-state-v%d", version) {
 		return ErrStorage
 	}
+	if err := s.loadRuntimeConfig(ctx, g); err != nil {
+		return err
+	}
 	if err := s.loadLegacyOrCurrentAudit(ctx, g); err != nil {
 		return err
 	}
@@ -374,6 +387,8 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 	if err != nil {
 		return err
 	}
+	seenIdentities := map[Identity]bool{}
+	seenDigests := map[string]bool{}
 	for rows.Next() {
 		var r storedPrincipal
 		var version int64
@@ -394,7 +409,11 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 			return ErrStorage
 		}
 		p, exists := g.principals[r.UserID]
-		if !exists || len(s.records) >= len(g.principals) || p.identity != (Identity{r.Tenant, r.Principal}) || len(r.TokenHash) != 32 || entryGeneration < 1 || revoked < 0 || revoked > 1 || strong < 0 || strong > 1 || version < 1 || (disabled != 0 && disabled != 1) || len(allowed) > 512<<10 {
+		identity := Identity{r.Tenant, r.Principal}
+		// 非 seed 身份只接受 v4 的 managed 命名；未签发身份必须保持撤销，
+		// 已签发身份必须有有限到期时间。此处只收集候选，MAC 通过后才恢复身份。
+		managed := !exists && s.version == 4 && r.UserID == managedUserID(identity)
+		if (!exists && !managed) || len(s.records) >= 64 || (exists && p.identity != identity) || identity.Tenant == "" || identity.Principal == "" || len(identity.Tenant) > 128 || len(identity.Principal) > 128 || seenIdentities[identity] || seenDigests[string(r.TokenHash)] || (managed && strong == 1 && r.TokenExpiresAt.IsZero()) || (managed && strong == 0 && revoked != 1) || len(r.TokenHash) != 32 || entryGeneration < 1 || revoked < 0 || revoked > 1 || strong < 0 || strong > 1 || version < 1 || (disabled != 0 && disabled != 1) || len(allowed) > 512<<10 {
 			rows.Close()
 			return ErrStorage
 		}
@@ -408,6 +427,8 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 				return ErrStorage
 			}
 		}
+		seenIdentities[identity] = true
+		seenDigests[string(r.TokenHash)] = true
 		r.EntryGeneration, r.EntryRevoked, r.EntryStrong = uint64(entryGeneration), revoked == 1, strong == 1
 		r.Version = uint64(version)
 		r.Disabled = disabled == 1
@@ -415,8 +436,13 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 	}
 	err = rows.Err()
 	rows.Close()
-	if err != nil || len(s.records) != len(g.principals) {
+	if err != nil {
 		return ErrStorage
+	}
+	for id := range g.principals {
+		if _, exists := s.records[id]; !exists {
+			return ErrStorage
+		}
 	}
 	rows, err = s.conn.QueryContext(ctx, "SELECT user_id,system,binding_id,generation,state,expires_at,credential FROM bindings ORDER BY user_id,system")
 	if err != nil {
@@ -453,6 +479,10 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 	if err != nil || !hmac.Equal(mac, s.stateMAC(s.records)) {
 		return ErrStorage
 	}
+	// 运行服务与 managed 用户同属已认证状态，先恢复服务再解密其绑定。
+	if err := s.restoreRuntimeSystems(g); err != nil {
+		return err
+	}
 	// 行结构与整体状态 MAC 都通过后才解密凭据、重建身份；构造期间失败的
 	// 网关不会返回给调用方，不能退回配置中的旧凭据继续启动。
 	restored := map[string]*principalState{}
@@ -479,10 +509,16 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 		g.entryStrong[id] = r.EntryStrong
 		u := g.users[id]
 		u.TokenExpiresAt = r.TokenExpiresAt
+		u.Tenant, u.Principal = r.Tenant, r.Principal
 		g.users[id] = u
+		// 原位补注册已认证身份的入口/出站桶，不从 bootstrap 重新导入凭据或策略。
+		g.identities[p.identity] = id
+		g.limiter.addIdentity(p.identity)
+		g.ingress.addIdentity(p.identity)
 		restored[id] = p
 	}
 	g.principals = restored
+	g.state.Store(g.makeSnapshot(map[string]map[string]entry{}))
 	return nil
 }
 func (s *sqliteStore) persist(g *Gateway, id string, p *principalState, event AuditEvent) error {

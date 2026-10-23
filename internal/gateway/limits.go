@@ -72,18 +72,21 @@ type admissionBucket struct {
 	last   time.Time
 }
 type admissionLimiter struct {
-	global     *admissionBucket
-	mu         sync.Mutex
-	now        func() time.Time
-	principals map[Identity]*admissionBucket
-	tenants    map[string]*admissionBucket
-	systems    map[string]*admissionBucket
-	shared     map[string]*admissionBucket
-	subjects   map[string]string
+	principalLimit, tenantLimit AdmissionLimit
+	systemLimit, sharedLimit    AdmissionLimit
+	global                      *admissionBucket
+	mu                          sync.Mutex
+	now                         func() time.Time
+	principals                  map[Identity]*admissionBucket
+	tenants                     map[string]*admissionBucket
+	systems                     map[string]*admissionBucket
+	shared                      map[string]*admissionBucket
+	subjects                    map[string]string
 }
 
-// newAdmissionLimiter allocates only configured scopes (at most 64 principals,
-// 64 tenants, 16 systems and 16 shared subjects). Admission never inserts keys.
+// newAdmissionLimiter allocates initial configured scopes (at most 64 principals,
+// 64 tenants, 16 systems and 16 shared subjects). Authenticated managed users
+// register through addIdentity after commit; admission never inserts keys.
 // systems maps a system name to its optional global shared-quota subject. Equal
 // subjects deliberately share a bucket across users, tenants AND systems.
 func newAdmissionLimiter(cfg LimitsConfig, identities []Identity, systems map[string]string) (*admissionLimiter, error) {
@@ -94,7 +97,7 @@ func newAdmissionLimiter(cfg LimitsConfig, identities []Identity, systems map[st
 	if len(identities) > 64 || len(systems) > 16 {
 		return nil, errors.New("admission scope limit exceeded")
 	}
-	l := &admissionLimiter{now: time.Now, principals: map[Identity]*admissionBucket{}, tenants: map[string]*admissionBucket{}, systems: map[string]*admissionBucket{}, shared: map[string]*admissionBucket{}, subjects: map[string]string{}}
+	l := &admissionLimiter{systemLimit: cfg.System, sharedLimit: cfg.SharedQuota, principalLimit: cfg.Principal, tenantLimit: cfg.Tenant, now: time.Now, principals: map[Identity]*admissionBucket{}, tenants: map[string]*admissionBucket{}, systems: map[string]*admissionBucket{}, shared: map[string]*admissionBucket{}, subjects: map[string]string{}}
 	now := l.now()
 	bucket := func(v AdmissionLimit) *admissionBucket {
 		return &admissionBucket{limit: v, tokens: float64(v.Burst), last: now}
@@ -130,6 +133,20 @@ func newAdmissionLimiter(cfg LimitsConfig, identities []Identity, systems map[st
 		}
 	}
 	return l, nil
+}
+
+// addIdentity 只为已提交或已认证恢复的身份原位补桶，调用方限制身份总数为 64。
+// 保留旧身份/租户桶及在途 permit，避免新增用户重置已有配额；准入本身不分配桶。
+func (l *admissionLimiter) addIdentity(id Identity) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if l.principals[id] == nil {
+		l.principals[id] = &admissionBucket{limit: l.principalLimit, tokens: float64(l.principalLimit.Burst), last: now}
+	}
+	if l.tenants[id.Tenant] == nil {
+		l.tenants[id.Tenant] = &admissionBucket{limit: l.tenantLimit, tokens: float64(l.tenantLimit.Burst), last: now}
+	}
 }
 
 type admissionPermit struct {
@@ -201,4 +218,23 @@ func (l *admissionLimiter) acquire(ctx context.Context, id Identity, system stri
 		}
 	}
 	return &admissionPermit{limiter: l, buckets: buckets}, nil
+}
+
+// addSystem 仅注册已认证或已提交服务，调用方将总数限制为 16。
+// 原位扩展而非重建 limiter，保留旧桶和在途 permit；相同 subject 继续共用旧桶，
+// 不因新增服务而获得一份额外配额。
+func (l *admissionLimiter) addSystem(name, subject string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.systems[name] != nil {
+		return
+	}
+	now := l.now()
+	l.systems[name] = &admissionBucket{limit: l.systemLimit, tokens: float64(l.systemLimit.Burst), last: now}
+	if subject != "" {
+		l.subjects[name] = subject
+		if l.shared[subject] == nil {
+			l.shared[subject] = &admissionBucket{limit: l.sharedLimit, tokens: float64(l.sharedLimit.Burst), last: now}
+		}
+	}
 }

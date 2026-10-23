@@ -151,7 +151,10 @@ func (g *Gateway) ReplaceBindingExpiring(identity Identity, system string, expec
 func (g *Gateway) replaceOwnBinding(identity Identity, system string, expected uint64, credential string, expiresAt time.Time) (BindingInfo, error) {
 	return g.replaceBinding(identity, system, expected, credential, expiresAt, true)
 }
-func (g *Gateway) replaceBinding(identity Identity, system string, expected uint64, credential string, expiresAt time.Time, own bool) (BindingInfo, error) {
+
+// replaceBinding 在同一锁内核对入口认证代次和绑定 CAS；HTTP 自助入口传入
+// entryGeneration，可信进程内管理调用可省略，不能把可选参数当作外部免认证开关。
+func (g *Gateway) replaceBinding(identity Identity, system string, expected uint64, credential string, expiresAt time.Time, own bool, entryGeneration ...uint64) (BindingInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	id, p, err := g.principalLocked(identity)
@@ -159,7 +162,7 @@ func (g *Gateway) replaceBinding(identity Identity, system string, expected uint
 		return BindingInfo{}, err
 	}
 	b, ok := p.bindings[system]
-	if !ok || p.disabled || (own && !g.principalUsableLocked(id)) {
+	if !ok || p.disabled || (own && !g.principalUsableLocked(id)) || (len(entryGeneration) > 0 && p.entry.Generation != entryGeneration[0]) {
 		return BindingInfo{}, ErrDenied
 	}
 	if b.info.Generation != expected {
@@ -188,7 +191,9 @@ func (g *Gateway) RevokeBinding(identity Identity, system string, expected uint6
 func (g *Gateway) revokeOwnBinding(identity Identity, system string, expected uint64) (BindingInfo, error) {
 	return g.revokeBinding(identity, system, expected, true)
 }
-func (g *Gateway) revokeBinding(identity Identity, system string, expected uint64, own bool) (BindingInfo, error) {
+
+// revokeBinding 与替换使用相同入口代次约束，防止旧 token 已认证的请求在轮换后撤销绑定。
+func (g *Gateway) revokeBinding(identity Identity, system string, expected uint64, own bool, entryGeneration ...uint64) (BindingInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	id, p, err := g.principalLocked(identity)
@@ -196,7 +201,7 @@ func (g *Gateway) revokeBinding(identity Identity, system string, expected uint6
 		return BindingInfo{}, err
 	}
 	b, ok := p.bindings[system]
-	if !ok || (own && !g.principalUsableLocked(id)) {
+	if !ok || (own && !g.principalUsableLocked(id)) || (len(entryGeneration) > 0 && p.entry.Generation != entryGeneration[0]) {
 		return BindingInfo{}, ErrDenied
 	}
 	if b.info.Generation != expected {
@@ -298,7 +303,8 @@ func (g *Gateway) entryAllowedLocked(id, name string, e entry) bool {
 	}
 	p := g.principals[id]
 	b := p.bindings[e.system.Name]
-	return b != nil && bindingUsable(b) && b.info.Generation == e.generation && p.version == e.policyVersion
+	current, exists := g.systems[e.system.Name]
+	return exists && current.revision == e.system.revision && b != nil && bindingUsable(b) && b.info.Generation == e.generation && p.version == e.policyVersion
 }
 func (g *Gateway) evaluateLocked(id, name string) (entry, bool) {
 	e, exists := g.state.Load().catalogs[id][name]

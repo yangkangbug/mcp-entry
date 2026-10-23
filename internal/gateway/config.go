@@ -30,6 +30,7 @@ type Config struct {
 // System 定义管理员配置的固定下游及认证方式；请求参数不能覆盖路由。
 // 非空 QuotaSubject 相同的系统共享出站配额桶，不改变各用户的凭据与工具权限。
 type System struct {
+	revision     uint64
 	QuotaSubject string         `json:"quota_subject,omitempty"`
 	Name         string         `json:"name"`
 	Endpoint     string         `json:"endpoint"`

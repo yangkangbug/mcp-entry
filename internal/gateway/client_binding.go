@@ -49,10 +49,13 @@ func (g *Gateway) clientServiceAllowedLocked(id, system string) bool {
 	return false
 }
 func (g *Gateway) clientServicesFor(id string) (clientServices, error) {
+	return g.clientServicesContext(context.Background(), id)
+}
+func (g *Gateway) clientServicesContext(ctx context.Context, id string) (clientServices, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	out := clientServices{Services: []clientService{}, Submission: "private_file_cli", Instructions: bindingInstructions}
-	if !g.clientBindingEnabled.Load() || !g.principalUsableLocked(id) {
+	if !g.clientBindingEnabled.Load() || !g.principalUsableLocked(id) || !g.entryRevisionAllowedLocked(ctx, id) {
 		return out, ErrDenied
 	}
 	p := g.principals[id]
@@ -91,7 +94,7 @@ func (g *Gateway) addClientBindingTool(server *mcp.Server, id string) {
 		if len(raw) > 64 || (len(raw) > 0 && (json.Unmarshal(raw, &args) != nil || args == nil || len(args) != 0)) {
 			return nil, errors.New("invalid control arguments")
 		}
-		out, err := g.clientServicesFor(id)
+		out, err := g.clientServicesContext(ctx, id)
 		if err != nil {
 			return nil, ErrDenied
 		}
@@ -100,8 +103,8 @@ func (g *Gateway) addClientBindingTool(server *mcp.Server, id string) {
 	})
 }
 
-// replaceClientBinding keeps policy, identity, generation and durable publication
-// in one lock scope. A credential cannot authorize an otherwise forbidden service.
+// replaceClientBinding 将策略、身份可用性、入口代次、绑定 CAS 及持久发布放在
+// 同一锁范围；提交下游凭据不能为原本无权限的服务授权，也不能跨入口轮换写入。
 func (g *Gateway) replaceClientBinding(identity Identity, system string, expected uint64, entryGeneration uint64, credential string, expiry time.Time) (BindingInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -167,13 +170,17 @@ func (g *Gateway) ClientBindingHandler(expectedOrigin string) (http.Handler, err
 			accountError(w, 401, "entry_authentication_rejected")
 			return
 		}
+		r = r.WithContext(withEntryRevision(r.Context(), identity, entryGeneration))
 		switch r.URL.Path {
 		case "/binding/api/services":
 			if r.Method != "GET" {
 				accountError(w, 405, "method_not_allowed")
 				return
 			}
-			out, err := g.clientServicesFor(g.identities[identity])
+			g.mu.Lock()
+			id := g.identities[identity]
+			g.mu.Unlock()
+			out, err := g.clientServicesContext(r.Context(), id)
 			if err != nil {
 				clientBindingFailure(w, err)
 				return
@@ -260,8 +267,8 @@ func (g *Gateway) ClientBindingHandler(expectedOrigin string) (http.Handler, err
 	})), nil
 }
 
-// Capture entry generation with authentication so rotation between request parsing
-// and mutation cannot allow a previously authenticated credential to write.
+// authenticateClientEntry 将入口认证和代次捕获放在同一锁内；解析请求后写入时
+// 再核对该代次，阻止已被轮换或撤销的旧 token 继续修改本人绑定。
 func (g *Gateway) authenticateClientEntry(r *http.Request) (Identity, uint64, bool) {
 	if len(r.Header.Values("Authorization")) != 1 || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		return Identity{}, 0, false
