@@ -165,10 +165,17 @@ func newPersistent(cfg Config, opts PersistenceOptions, maintenance bool) (*Gate
 	for id, p := range g.principals {
 		identities[id] = p.identity
 	}
+	// Runtime budgets do not alter authority or routing. Omit them entirely to
+	// preserve the pre-timeouts topology bytes and authenticated existing stores.
+	topologySystems := make(map[string]System, len(g.systems))
+	for name, system := range g.systems {
+		system.Timeouts = nil
+		topologySystems[name] = system
+	}
 	topologyJSON, _ := json.Marshal(struct {
 		Systems    map[string]System
 		Identities map[string]Identity
-	}{g.systems, identities})
+	}{topologySystems, identities})
 	topology := sha256.Sum256(topologyJSON)
 	store := &sqliteStore{version: 4, allowLegacy: maintenance && opts.Migrate, db: db, aead: aead, macKey: macKey, topology: topology[:], records: map[string]storedPrincipal{}}
 	auditKey, err := derivedKey(opts.Key, "audit-chain")

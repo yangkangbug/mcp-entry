@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -34,7 +35,35 @@ type System struct {
 	Endpoint     string         `json:"endpoint"`
 	Auth         AuthConfig     `json:"auth,omitempty"`
 	Network      *NetworkPolicy `json:"network,omitempty"`
+	Timeouts     *TimeoutConfig `json:"timeouts,omitempty"`
+	budgets      timeoutBudgets
 	transport    http.RoundTripper
+}
+
+// UnmarshalJSON keeps strict nested decoding and distinguishes explicit null
+// from omission. Programmatic nil Timeouts means the legacy default profile.
+func (s *System) UnmarshalJSON(data []byte) error {
+	type plain System
+	fields, err := uniqueObjectFields(data)
+	if err != nil {
+		return err
+	}
+	for key := range fields {
+		if strings.EqualFold(key, "timeouts") && key != "timeouts" {
+			return errors.New("timeouts field must use canonical spelling")
+		}
+	}
+	if value, ok := fields["timeouts"]; ok && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return errors.New("timeouts must be an object")
+	}
+	var decoded plain
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	*s = System(decoded)
+	return nil
 }
 
 // AuthConfig selects a single administrator-configured credential header.
@@ -153,4 +182,39 @@ func validNamespaced(name string, systems map[string]System) bool {
 func validateEndpoint(endpoint string) bool {
 	u, err := url.Parse(endpoint)
 	return err == nil && u.Scheme == "http" && u.User == nil && u.RawQuery == "" && u.Fragment == "" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")
+}
+
+// uniqueObjectFields rejects duplicate case-insensitive keys before typed JSON
+// decoding can silently merge them. Used for the new runtime configuration.
+func uniqueObjectFields(data []byte) (map[string]json.RawMessage, error) {
+	d := json.NewDecoder(bytes.NewReader(data))
+	first, err := d.Token()
+	if err != nil || first != json.Delim('{') {
+		return nil, errors.New("expected configuration object")
+	}
+	fields := map[string]json.RawMessage{}
+	seen := map[string]bool{}
+	for d.More() {
+		token, err := d.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := token.(string)
+		if !ok || seen[strings.ToLower(key)] {
+			return nil, errors.New("duplicate configuration field")
+		}
+		seen[strings.ToLower(key)] = true
+		var value json.RawMessage
+		if err := d.Decode(&value); err != nil {
+			return nil, err
+		}
+		fields[key] = value
+	}
+	if _, err := d.Token(); err != nil {
+		return nil, err
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return nil, errors.New("trailing configuration")
+	}
+	return fields, nil
 }

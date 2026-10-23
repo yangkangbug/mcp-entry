@@ -606,3 +606,40 @@ pre {
 #policy-allowed {
   margin-bottom:16px
 }
+
+/* Operational hierarchy: compact overview, scoped detail, explicit local edits. */
+h1 { font-size:28px; margin-bottom:8px; letter-spacing:-.5px }
+main { padding:24px 28px 18px }
+.topbar { height:64px; padding:0 28px }
+.page-heading { margin-bottom:18px }
+.page-heading .eyebrow { margin-bottom:5px }
+.lede { margin-bottom:0 }
+.panel { padding:18px; margin-bottom:16px }
+.panel>button { margin:6px 8px 0 0 }
+th { font-size:13px; letter-spacing:0; padding:10px }
+td { padding:11px 10px }
+td small { display:block; margin-top:3px }
+label,.capability,.sidebar-note,footer { font-size:13px }
+.status-inline { color:var(--muted); font-size:13px; margin:0 0 12px }
+.status-box.error { border-left:3px solid var(--danger) }
+.danger-zone { border-color:#dfb6bb }
+.danger-zone h2 { color:var(--danger) }
+.break-word, .panel, .tool-option span { overflow-wrap:anywhere }
+.workspace,.panel,.tool-option span { min-width:0 }
+fieldset { border:1px solid var(--line); border-radius:8px; padding:8px 12px; margin:14px 0 }
+legend { font-weight:650; padding:0 6px; overflow-wrap:anywhere; max-width:100% }
+.tool-option { display:flex; align-items:flex-start; gap:10px; padding:9px 4px; margin:0; font-size:14px; font-weight:400 }
+.tool-option input { width:18px; height:18px; flex:0 0 18px; margin:3px 0 0; accent-color:var(--accent) }
+#policy-diff { border-top:1px solid var(--line); padding-top:12px; margin-top:14px }
+td details { margin:4px 0; font-size:12px }
+td summary { padding:0 }
+@media(max-width:700px) {
+  main { padding:20px 14px }
+  .topbar { height:auto; padding:12px 14px }
+  .top-actions { flex-wrap:wrap }
+  .panel { padding:14px }
+  h1 { font-size:25px }
+  .hero { gap:12px }
+  table { min-width:540px }
+  .panel>button { max-width:100%; white-space:normal; overflow-wrap:anywhere }
+}

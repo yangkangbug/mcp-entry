@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -304,21 +305,22 @@ const (
 )
 
 type protocolLegacyFixture struct {
-	server       *httptest.Server
-	log          protocolLog
-	version      string
-	sse          bool
-	fallbackHTTP bool
-	eventID      bool
-	callMode     atomic.Int32
-	oversizeList atomic.Bool
-	sequence     atomic.Int32
-	callBlock    *cleanupBlock
-	deleteBlock  *cleanupBlock
-	teardown     chan struct{}
-	stopOnce     sync.Once
-	mu           sync.Mutex
-	sessions     map[string]string
+	server            *httptest.Server
+	log               protocolLog
+	version           string
+	sse               bool
+	fallbackHTTP      bool
+	eventID           bool
+	callMode          atomic.Int32
+	oversizeList      atomic.Bool
+	oversizeResponses atomic.Int32
+	sequence          atomic.Int32
+	callBlock         *cleanupBlock
+	deleteBlock       *cleanupBlock
+	teardown          chan struct{}
+	stopOnce          sync.Once
+	mu                sync.Mutex
+	sessions          map[string]string
 }
 
 func newProtocolLegacyFixture(t *testing.T, version, format string) (*protocolLegacyFixture, *gateway.Gateway) {
@@ -418,6 +420,9 @@ func newProtocolLegacyFixture(t *testing.T, version, format string) (*protocolLe
 		if err != nil {
 			t.Errorf("encode result: %v", err)
 			return
+		}
+		if len(body) > 1<<20 {
+			f.oversizeResponses.Add(1)
 		}
 		if !f.sse {
 			w.Header().Set("Content-Type", "application/json")
@@ -733,11 +738,17 @@ func TestProtocolResponseByteBound(t *testing.T) {
 			f, g := newProtocolLegacyFixture(t, "2025-11-25", format)
 			protocolRefresh(t, g)
 			f.callMode.Store(protocolCallOversized)
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
+			// Each operation retains the production call/discovery deadline. Do not
+			// share a wall-clock allowance across three >1 MiB responses: race
+			// instrumentation and scheduler load are not byte-bound evidence.
+			ctx := context.Background()
 			result, err := g.Call(ctx, "alice", "test__echo", protocolInput{"oversized"})
 			if err == nil || result != nil {
 				t.Fatalf("oversized %s result accepted: result=%+v error=%v", format, result, err)
+			}
+			var failure *gateway.DownstreamFailure
+			if !errors.As(err, &failure) || !protocolSizeFailure(failure, gateway.FailureCall) || f.oversizeResponses.Load() != 1 {
+				t.Fatalf("oversized call did not fail on response: failure=%+v responses=%d", failure, f.oversizeResponses.Load())
 			}
 			if calls := f.log.count("tools/call"); calls != 1 {
 				t.Fatalf("oversized result caused replay: count=%d", calls)
@@ -747,10 +758,32 @@ func TestProtocolResponseByteBound(t *testing.T) {
 			if len(issues) != 2 || len(g.Names("alice")) != 0 || len(g.Names("bob")) != 0 {
 				t.Fatalf("oversized catalog did not fail closed: issues=%v alice=%v bob=%v", issues, g.Names("alice"), g.Names("bob"))
 			}
-			if ctx.Err() != nil {
-				t.Fatal("response size failure depended on caller deadline")
+			for _, issue := range issues {
+				if !protocolSizeFailure(issue.Failure, gateway.FailureDiscovery) {
+					t.Fatalf("oversized catalog failed for another reason: %+v", issue)
+				}
+			}
+			if f.oversizeResponses.Load() != 3 {
+				t.Fatalf("oversized responses=%d, want call and both catalogs", f.oversizeResponses.Load())
 			}
 		})
+	}
+}
+
+// SDK wrapping may report a rejected body as transport or protocol failure.
+// Neither operation deadlines nor caller cancellation can satisfy this check.
+// TestResponseSizeBound separately verifies MaxBytesError and <= 1 MiB.
+func protocolSizeFailure(f *gateway.DownstreamFailure, phase gateway.FailurePhase) bool {
+	return f != nil && f.Phase == phase && (f.Code == gateway.FailureTransport || f.Code == gateway.FailureProtocol)
+}
+
+func TestProtocolSizeFailureRejectsBudgetEvidence(t *testing.T) {
+	for _, phase := range []gateway.FailurePhase{gateway.FailureCall, gateway.FailureDiscovery} {
+		for _, code := range []gateway.FailureCode{gateway.FailureTimeout, gateway.FailureCanceled} {
+			if protocolSizeFailure(&gateway.DownstreamFailure{Code: code, Phase: phase}, phase) {
+				t.Fatalf("budget evidence accepted as byte-bound failure: %s / %s", code, phase)
+			}
+		}
 	}
 }
 

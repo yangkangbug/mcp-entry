@@ -23,9 +23,9 @@ Do not infer a missing HTTP status from text inside an error or tool result. A
 business `IsError` result is still a received tool result, not a transport failure.
 No new logging fields, persistent schema, or API are introduced by this guide.
 
-## Current budgets
+## Default budgets
 
-These are source-code budgets, not guaranteed elapsed times or additive allowances.
+These are the legacy defaults, not guaranteed elapsed times or additive allowances.
 Earlier parent deadlines win. Transport stages share the operation's remaining time.
 
 | Boundary | Budget | Scope / source |
@@ -40,8 +40,77 @@ Earlier parent deadlines win. Transport stages share the operation's remaining t
 | Response headers | 5 s | Network policy transport; not a complete-body deadline |
 | Session cleanup | No fresh allowance | Shares operation context; cleanup cannot extend the operation with a new budget |
 
-Client/proxy timers outside this process must be checked separately. These values
-must not be increased merely to make a failing case disappear.
+Client/proxy timers outside this process must be checked separately. Budgets must not be increased merely to make a failing case disappear.
+
+## Controlled per-system budgets
+
+An administrator may opt a fixed system into a bounded profile in local startup
+configuration. This is not a tool argument, live update, or retry mechanism:
+
+```json
+"timeouts": {
+  "discovery_ms": 5000,
+  "call_ms": 30000,
+  "response_header_ms": 25000
+}
+```
+
+Omitting `timeouts` preserves all defaults above. If present, all three values
+are required integer milliseconds in **1..120000**, and response headers must
+not exceed `max(discovery_ms, call_ms)`. Null, empty objects, missing fields,
+zero, negative, fractional, unknown fields and out-of-range values are rejected.
+Timeout field names must use the exact lowercase spelling shown; duplicate keys
+and case aliases are rejected before decoding (including in admin drafts).
+Programmatic `System.Timeouts == nil` likewise selects defaults. The 120-second
+ceiling is a resource guardrail, **not** a recommended setting or a promise that
+an ingress caller/proxy will wait that long.
+
+Discovery and calls have separate total context budgets. In this example a
+25-second header ceiling does **not** extend discovery beyond five seconds.
+Each request is clipped by the current operation's remaining time and any earlier
+parent deadline, including connection negotiation, body reads and synchronous
+cleanup. The HTTP client cap is derived as `max(discovery, call) + 2 seconds`
+(default 12 seconds, maximum 122 seconds); it never gives a request or cleanup a
+fresh operation allowance. DNS, dial and TLS remain capped at three seconds.
+No proxy, TLS, IP allowlist, endpoint, authentication or retry policy changes.
+A large header budget does not reserve time for the body or cleanup.
+
+Budgets are local runtime settings, excluded from the authenticated identity/
+routing topology fingerprint. Existing databases remain readable without a
+migration; changing only budgets on restart does not re-import seed credentials,
+restore revoked access, or reset audit state. Endpoint, network and authentication
+changes still fail topology validation. A configuration draft validates these
+fields but does not apply them; edit the authorized startup configuration and
+restart the single instance to use a different profile.
+
+## Synthetic five-second boundary evidence
+
+`TestServiceTimeoutRealFiveSecondBoundary` uses the real gateway and default
+network transport against loopback fake data. A response withheld for 5.5 seconds
+hits the default five-second header timer; the deliberately non-cooperative
+handler still completes afterwards. Exactly one call is dispatched, the linked
+start/terminal audit retains timeout and `outcome_unknown=true`, and neither
+credentials nor endpoint/result canaries appear in the audit. Parallel controls
+show the same 5.5-second response succeeds with a per-system 8-second call /
+7-second header profile, and succeeds under defaults when headers arrive first
+and only the body is delayed. These tests add roughly 5.5 seconds in parallel,
+not a 15–21-second real-service probe.
+
+`TestServiceTimeoutDiscoveryClipsLargerHeader` checks a shorter discovery budget
+still clips a longer header ceiling. Configuration and restart tests cover bounds,
+legacy serialization, and persisted revocation surviving a budget-only change.
+`TestServiceTimeoutConfiguredOperationAndCleanup` uses short configured profiles
+to verify discovery-body and call-body deadlines, an earlier parent deadline, and
+synchronous cleanup sharing the remaining budget without replacing a confirmed
+result.
+Existing test-only deadline matrices below separately cover parent, operation,
+HTTP client, JSON/SSE body and cleanup behavior.
+
+This reproduces a **possible mechanism**, not the root cause of incident #8.
+The reported 5.27-second failure is consistent with the five-second header limit,
+but lacks independent per-stage tracing; the actual incident cause remains
+undetermined. Later downstream completion never changes what was known when the
+gateway returned. No real downstream call or production setting was changed.
 
 ## Interpret the evidence without overclaiming
 

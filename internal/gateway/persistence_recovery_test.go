@@ -600,3 +600,31 @@ func TestPersistenceRecoveryProcessOwnerCrash(t *testing.T) {
 	_ = g.Refresh(ctx)
 	assertRevocationDenied(t, ctx, g, f, "east-user")
 }
+
+// Defaults retain the historical topology serialization; changing only runtime
+// budgets must preserve authenticated state instead of reseeding old grants.
+func TestPersistenceServiceTimeoutRestartPreservesRevocation(t *testing.T) {
+	f := newRevocationFixture(t)
+	cfg := recoveryConfig(f)
+	opts := recoveryOptions(t)
+	g := recoveryOpen(t, cfg, opts)
+	old, _ := g.Binding(revocationEast, "shared")
+	revoked, err := g.RevokeBinding(revocationEast, "shared", old.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryClose(t, g)
+	opts.Initialize = false
+	cfg.Systems[0].Timeouts = &gateway.TimeoutConfig{DiscoveryMS: 5000, CallMS: 30000, ResponseHeaderMS: 25000}
+	g = recoveryOpen(t, cfg, opts)
+	got, err := g.Binding(revocationEast, "shared")
+	if err != nil || got != revoked {
+		t.Fatalf("runtime budget reset state: %+v %v", got, err)
+	}
+	recoveryClose(t, g)
+	cfg.Systems[0].Auth = gateway.AuthConfig{Mode: "raw"}
+	recoveryReject(t, cfg, opts) // The timeout exception must not weaken auth topology.
+	cfg.Systems[0].Auth = gateway.AuthConfig{}
+	cfg.Systems[0].Endpoint = "http://127.0.0.1:1"
+	recoveryReject(t, cfg, opts)
+}

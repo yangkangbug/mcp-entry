@@ -104,6 +104,15 @@ func newGateway(cfg Config, bootstrap bool) (*Gateway, error) {
 			return nil, err
 		}
 		system.Auth = auth
+		budgets, err := resolveTimeouts(system.Timeouts)
+		if err != nil {
+			return nil, err
+		}
+		system.budgets = budgets
+		if system.Timeouts != nil {
+			copy := *system.Timeouts
+			system.Timeouts = &copy
+		}
 		if system.Network != nil {
 			copy := *system.Network
 			copy.AllowedIPs = append([]string(nil), copy.AllowedIPs...)
@@ -113,6 +122,7 @@ func newGateway(cfg Config, bootstrap bool) (*Gateway, error) {
 		if err != nil {
 			return nil, err
 		}
+		transport.(*endpointTransport).base.ResponseHeaderTimeout = budgets.responseHeader
 		system.transport = transport
 		g.systems[system.Name] = system
 	}
@@ -326,7 +336,7 @@ func connect(ctx context.Context, system System, token string, admission *catalo
 }
 
 func (g *Gateway) discover(ctx context.Context, system System, token string, allowed map[string]bool) (resultEntries map[string]entry, retErr error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, system.timeoutBudgets().discovery)
 	defer cancel()
 	ctx, observation := withFailureObservation(ctx)
 	observation.setPhase(FailureConnect)
@@ -572,7 +582,7 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 		g.rejectOperation(ctx, RejectionOperationArguments)
 		return nil, errors.New("arguments do not match discovered schema")
 	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, e.system.timeoutBudgets().call)
 	defer cancel()
 	// Final dispatch admission and revocation share this lock. A request admitted
 	// first is in flight even if its first network byte is sent later.
@@ -785,15 +795,19 @@ func (b *operationBody) Close() error {
 }
 
 func downstreamOperationClient(ctx context.Context, token string, system System) *http.Client {
+	budgets, err := resolveTimeouts(system.Timeouts)
+	if err != nil {
+		return &http.Client{Transport: deniedTransport{}}
+	}
 	base := system.transport
 	if base == nil {
-		var err error
 		base, err = compileNetworkPolicy(system.Endpoint, system.Network)
 		if err != nil {
 			return &http.Client{Transport: deniedTransport{}}
 		}
+		base.(*endpointTransport).base.ResponseHeaderTimeout = budgets.responseHeader
 	}
-	return &http.Client{Transport: observeFailureTransport(ctx, credentialTransport{auth: system.Auth, token: token, base: base, operation: ctx}), Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
+	return &http.Client{Transport: observeFailureTransport(ctx, credentialTransport{auth: system.Auth, token: token, base: base, operation: ctx}), Timeout: budgets.client, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
 }
 
 type deniedTransport struct{}

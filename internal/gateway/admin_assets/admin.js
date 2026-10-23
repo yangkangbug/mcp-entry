@@ -12,6 +12,8 @@
       busy:false,
       snapshot:null,
       userKey:'',
+      serviceName:'',
+      policySearch:'',
       preview:null,
       audit:null,
       draft:null,
@@ -52,7 +54,7 @@
         'Operator console'],
       workspace:['工作空间',
         'WORKSPACE'],
-      preview:['合成环境预览',
+      preview:['原型 · 仅合成验证',
         'Synthetic preview'],
       plane:['管理接入与授权，不代替用户的 MCP 客户端。',
         'Manage connections and access, not the user’s MCP client.'],
@@ -94,8 +96,27 @@
       return b;
     }
     function timestamp(value) {
-      return !value||String(value).startsWith('0001-')?text('未设置 / 未记录',
-        'Not set / not recorded'):value;
+      if(!value||String(value).startsWith('0001-'))return text('未设置 / 未记录', 'Not set / not recorded');
+      const date=new Date(value);
+      if(Number.isNaN(date.getTime()))return text('时间格式未知', 'Unknown time format');
+      return new Intl.DateTimeFormat(state.lang, {timeZone:'UTC', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hourCycle:'h23'}).format(date)+' UTC';
+    }
+    function timeDetail(value, expiry=false) {
+      const wrap=el('div', timestamp(value));
+      if(value&&!String(value).startsWith('0001-')) {
+        const date=new Date(value);
+        if(expiry&&!Number.isNaN(date.getTime())) {
+          const days=Math.ceil((date.getTime()-Date.now())/86400000);
+          wrap.appendChild(el('small', days<=0?text(' · 已到期',' · Expired'):text(' · 约 '+days+' 天后到期',' · Expires in about '+days+' days')));
+        }
+        const details=el('details');
+        append(details, el('summary', text('原始时间','Original timestamp')), el('code', value));
+        wrap.appendChild(details);
+      }
+      return wrap;
+    }
+    function help(title, content) {
+      return append(el('details'), el('summary', title), el('p', content, 'muted'));
     }
     function bindingState(value) {
       const labels= {
@@ -193,7 +214,7 @@
       const n=$('message');
       n.replaceChildren();
       if(state.notice) {
-        n.className='status-box'+(state.notice.error?' error':'');
+        n.className=state.notice.error?'status-box error':'status-inline';
         n.textContent=text(state.notice.zh,
           state.notice.en)
       }else n.className='';
@@ -245,6 +266,7 @@
           state.userKey=sel.value;
           state.preview=null;
           state.policyDraft=null;
+          state.policySearch='';
           render()
       });
       append(parent,
@@ -269,6 +291,8 @@
       state.configForm= {
       };
       state.userKey='';
+      state.serviceName='';
+      state.policySearch='';
       state.notice=null;
       $('admin-token').value='';
       render();
@@ -419,6 +443,7 @@
             'Expected version: ')+b.expected_version));
       if(b.action==='disable_principal')p.appendChild(note('禁用后该用户不能继续使用网关。当前管理台没有重新启用操作，请先确认维护恢复路径。',
           'Disabling blocks this user from the gateway. This console has no re-enable action; confirm the maintenance recovery path first.'));
+      if(b.allowed&&user())policyDiff(p,user(),b.allowed);
       if(b.allowed)append(p,
         el('pre',
           b.allowed.join('\n')||text('空白名单：移除所有工具授权',
@@ -468,8 +493,8 @@
         pages[state.page][3]);
       $('authentication').hidden=!!state.snapshot;
       $('connection-state').textContent=state.busy?text('处理中…',
-        'Working…'):state.snapshot?text('已连接 · ',
-        'Connected · ')+text(state.snapshot.persistent?'持久模式':'内存模式',
+        'Working…'):state.snapshot?text('管理连接已建立 · 存储：',
+        'Management connected · Storage: ')+text(state.snapshot.persistent?'持久模式':'内存模式',
         state.snapshot.persistent?'Persistent':'In memory'):text('未连接',
         'Disconnected');
       $('connection-state').className='badge'+(state.snapshot?' good':'');
@@ -519,270 +544,153 @@
       p.appendChild(flow);
       c.appendChild(p);
     }
+    function serviceFacts(service, u) {
+      return {binding:u?.bindings?.find(b=>b.system===service.name), tools:(u?.tools||[]).filter(t=>t.system===service.name)};
+    }
+    function serviceTable(u) {
+      return table([text('服务','Service'),text('凭据绑定','Credential binding'),text('已发现 / 当前获准工具','Discovered / currently allowed tools'),text('查看','Inspect')],
+        state.snapshot.services.map(service=> {
+          const {binding,tools}=serviceFacts(service,u);
+          return [append(el('div'),el('strong',service.name),el('small',text('已配置 · 认证健康未检查','Configured · Auth health not checked'))),
+            !u?text('未选择身份','No identity selected'):binding?bindingState(binding.state):text('无绑定记录','No binding record'),
+            !u?'—':tools.length+' / '+tools.filter(t=>t.authorized).length,
+            button(text('查看服务','View service')+' · '+service.name,()=>{state.serviceName=service.name;navigate('services');})];
+        }));
+    }
     function renderOverview(c) {
-      const s=state.snapshot;
-      const p=panel(text('先接入服务，再开放给用户',
-          'Connect services before granting access'),
-        text('管理员配置固定服务与工具白名单。用户在 MCP 客户端使用网关 token，按需通过安全通道补齐服务凭据。',
-          'Operators configure fixed services and tool allowlists. Users connect with a gateway token and supply provider credentials through a secure channel when needed.'));
-      p.classList.add('hero');
-      append(p,
-        button(text('准备接入配置',
-            'Prepare service configuration'),
-          ()=>navigate('config'),
-          'primary'));
-      c.appendChild(p);
-      const m=el('div',
-        undefined,
-        'metrics');
-      append(m,
-        metric(text('已配置服务',
-            'Configured services'),
-          s.services.length,
-          text('配置存在 ≠ 发现可用',
-            'Configured ≠ discovered')),
-        metric(text('配置用户',
-            'Configured users'),
-          s.users.length,
-          text('身份来自运行配置',
-            'Identities in running configuration')),
-        metric(text('P95 延迟',
-            'P95 latency'),
-          '—',
-          text('尚未采集',
-            'Not collected')),
-        metric(text('全站成功率',
-            'Global success rate'),
-          '—',
-          text('缺少完整分母与时间窗口',
-            'No complete denominator or window')));
-      c.appendChild(m);
-      const grid=el('div',
-        undefined,
-        'grid-two');
-      const steps=panel(text('接入路径',
-          'Connection path'));
-      const ol=el('ol',
-        undefined,
-        'steps');
-      [[text('准备服务配置',
-            'Prepare service configuration'),
-          text('静态校验草稿；不应用、不重启。',
-            'Validate a draft; no apply or restart.')],
-        [text('配置身份与工具授权',
-            'Configure identity and tool access'),
-          text('入口颁发走受信离线维护；白名单可在此管理。',
-            'Issue entry tokens through trusted offline maintenance; manage allowlists here.')],
-        [text('客户端按需绑定',
-            'Client-driven binding'),
-          text('后台绑定本人服务凭据。已有显式启用的本机 CLI 合成通道；原生客户端集成待验证，不降级到聊天输入。',
-            'The backend binds the user’s provider credential. An opt-in local CLI channel exists for synthetic tests; native client integration is unverified. Never use chat input.')]].forEach(([a,
-            b])=>append(ol,
-          append(el('li',
-              a),
-            el('span',
-              b))));
-      steps.appendChild(ol);
-      const limits=panel(text('当前运行边界',
-          'Current operating boundaries'));
-      append(limits,
-        note(s.persistent?'持久状态开启。服务/用户拓扑变更需要迁移支持，不能直接应用草稿。':'内存模式：重启会丢失动态状态。不要将这里的修改当成持久配置。',
-          s.persistent?'Persistent state is enabled. Service/user topology changes require migration support; drafts cannot be applied directly.':'In-memory mode: restart loses dynamic state. Changes here are not durable configuration.'),
-        el('p',
-          text('发现按身份观察；已保存凭据不代表认证有效。',
-            'Discovery is observed per identity; stored credentials do not prove valid authentication.')),
-        button(text('查看真实运行记录',
-            'Inspect operational records'),
-          ()=>navigate('audit')));
-      append(grid,
-        steps,
-        limits);
-      c.appendChild(grid);
+      if(!state.snapshot.services.length) {
+        const p=panel(text('接入第一个 MCP 服务','Connect your first MCP service'),text('先生成并校验本地草稿；在线应用尚未开放。','Start with a local draft. Online application is not available.'));
+        p.classList.add('hero');
+        append(p,button(text('准备接入配置','Prepare service configuration'),()=>navigate('config'),'primary'));
+        c.appendChild(p);
+      }else {
+        const p=panel(text('服务概况','Service overview'),text('以下绑定与目录仅属于所选身份。目录是保留的发现结果，不代表实时在线。','Bindings and catalogs below belong only to the selected identity. Retained discovery is not live uptime.'));
+        const u=userPicker(p);
+        p.appendChild(serviceTable(u));c.appendChild(p);
+        const attention=panel(text('需要关注','Needs attention'));
+        if(u) {
+          const items=[];
+          if(u.disabled)items.push(text('此身份已禁用，不能继续使用网关。','This identity is disabled and cannot use the gateway.'));
+          state.snapshot.services.forEach(service=> {
+            const {binding,tools}=serviceFacts(service,u);
+            if(!binding||binding.state!=='active')items.push(service.name+' · '+(binding?bindingState(binding.state):text('无绑定记录','No binding record')));
+            if(!tools.length)items.push(service.name+' · '+text('尚无发现目录；不能据此判断无授权或服务故障。','No discovery catalog; this does not establish missing access or a service failure.'));
+          });
+          const absent=(u.allowed||[]).filter(name=>!(u.tools||[]).some(t=>t.name===name));
+          if(absent.length)items.push(text('有 '+absent.length+' 项授权暂未在目录中发现，仍予保留。',absent.length+' allowed tools are absent from discovery and remain retained.'));
+          if(items.length)append(attention,...items.map(v=>el('p',v)));
+          else attention.appendChild(el('p',text('当前快照没有上述待处理事项；认证健康仍未检查。','No listed attention items in this snapshot; authentication health remains unchecked.')));
+        }else empty(attention,'尚无身份，无法观察绑定与目录。','No identity is available to inspect bindings and catalogs.');
+        append(attention,button(text('管理工具授权','Manage tool access'),()=>navigate('policy')),button(text('准备接入配置','Prepare service configuration'),()=>navigate('config')));
+        c.appendChild(attention);
+      }
+      c.appendChild(help(text('运行范围与尚未采集的指标','Operating scope and unavailable metrics'),text('P95 延迟尚未采集；全站成功率缺少完整分母与时间窗口。已保存凭据不证明认证有效。'+(state.snapshot.persistent?'持久状态开启；拓扑变更仍需迁移。':'内存存储：重启会丢失动态状态。'),'P95 is not collected; global success rate lacks a complete denominator and window. Stored credentials do not prove authentication. '+(state.snapshot.persistent?'Persistent state; topology changes still require migration.':'In-memory storage loses dynamic state on restart.'))));
     }
     function renderServices(c) {
-      const p=panel(text('运行中的服务配置',
-          'Running service configuration'),
-        text('服务认证健康未主动检查。工具目录是按身份保留的发现结果，不代表持续在线。',
-          'Provider authentication health is not actively checked. Tool catalogs are retained per identity, not continuous uptime checks.'));
-      if(!state.snapshot.services.length)empty(p,
-        '尚未配置 MCP 服务。先准备配置草稿。',
-        'No MCP services configured. Prepare a draft first.');
-      else p.appendChild(table([text('服务 ID',
-              'Service ID'),
-            text('固定端点',
-              'Fixed endpoint'),
-            text('认证方式',
-              'Authentication'),
-            text('认证健康',
-              'Authentication health')],
-          state.snapshot.services.map(s=>[s.name,
-              s.endpoint,
-              (s.auth?.mode||'bearer')+(s.auth?.header?' / '+s.auth.header:''),
-              badge(text('未检查',
-                  'Not checked'))])));
-      append(p,
-        button(text('准备接入配置',
-            'Prepare service configuration'),
-          ()=>navigate('config'),
-          'primary'));
+      const p=panel(text('已配置服务','Configured services'),text('按身份查看绑定与目录；认证健康未检查。','Inspect bindings and discovery by identity; authentication health is not checked.'));
+      const u=userPicker(p);
+      if(!state.snapshot.services.length)empty(p,'尚未配置 MCP 服务。先准备配置草稿。','No MCP services configured. Prepare a draft first.');
+      else p.appendChild(serviceTable(u));
+      p.appendChild(button(text('准备接入配置','Prepare service configuration'),()=>navigate('config')));
       c.appendChild(p);
-      c.appendChild(note('服务 token 不在管理台收集。由客户端的安全通道向后台提交，并绑定到已认证身份；不是要求员工访问绑定页。',
-          'Provider tokens are not collected here. A secure client channel submits them to the backend for the authenticated identity; employees are not sent to a binding page.'));
+      const service=state.snapshot.services.find(s=>s.name===state.serviceName);
+      if(!service)return;
+      const d=panel(text('服务详情 · ','Service details · ')+service.name);
+      d.id='service-detail';
+      const {binding,tools}=serviceFacts(service,u);
+      append(d,el('p',text('身份范围：','Identity scope: ')+(u?u.tenant+' / '+u.principal:text('未选择','Not selected'))),
+        el('p',text('固定端点：','Fixed endpoint: ')+service.endpoint,'break-word'),
+        el('p',text('认证方式：','Authentication: ')+(service.auth?.mode||'bearer')+(service.auth?.header?' / '+service.auth.header:'')),
+        el('p',text('配置已存在；认证健康未检查，没有最近检查时间或错误类别证据。','Configuration exists; auth health is not checked. No last-check timestamp or error-category evidence is available.')));
+      if(u) {
+        append(d,el('h3',text('此身份的凭据绑定','Credential binding for this identity')),el('p',binding?bindingState(binding.state)+text(' · 凭证版本 ',' · Credential version ')+binding.generation:text('无绑定记录','No binding record')));
+        if(binding)d.appendChild(timeDetail(binding.expires_at,true));
+        d.appendChild(el('h3',text('此身份的工具目录','Tool catalog for this identity')));
+        if(!tools.length)empty(d,'尚无发现目录，不等于没有授权。','No discovered catalog; this does not mean no access was granted.');
+        else d.appendChild(table([text('完整工具名','Exact tool name'),text('白名单','Allowlist'),text('当前访问判定','Current access decision')],tools.map(t=>[t.name,(u.allowed||[]).includes(t.name)?text('明确列入','Listed'):text('未列入','Not listed'),t.authorized?text('获准','Allowed'):text('未获准','Not allowed')])));
+        d.appendChild(button(text('管理此身份授权','Manage access for this identity'),()=>navigate('policy')));
+      }
+      append(d,button(text('查看运行与审计','View operations & audit'),()=>navigate('audit')),el('small',text('审计入口展示保留事件样本，不按此服务筛选。','Audit shows retained event samples, not a service-filtered view.')));
+      c.appendChild(d);
     }
     function renderUsers(c) {
-      const p=panel(text('身份与入口状态',
-          'Identity & entry state'));
-      const u=userPicker(p);
-      c.appendChild(p);
-      if(!u)return;
-      append(p,
-        table([text('租户 / 身份',
-              'Tenant / identity'),
-            text('用户状态',
-              'User status'),
-            text('入口代次',
-              'Entry generation'),
-            text('入口状态 / 到期',
-              'Entry state / expiry')],
-          [[u.tenant+' / '+u.principal,
-              badge(u.disabled?text('已禁用',
-                  'Disabled'):text('未禁用',
-                  'Enabled'),
-                u.disabled?'bad':'good'),
-              u.entry?.generation??'—',
-              (u.entry?.revoked?text('已撤销',
-                  'Revoked'):text('未标记撤销',
-                  'Not marked revoked'))+' / '+timestamp(u.entry?.expires_at)]]));
-      const actions=el('div',
-        undefined,
-        'actions');
-      append(actions,
-        button(text('预览禁用此用户',
-            'Preview disabling user'),
-          ()=>mutate( {
-              action:'disable_principal',
-              tenant:u.tenant,
-              principal:u.principal,
-              expected_version:u.policy_version
-            },
-            false),
-          'danger',
-          state.busy||u.disabled||!capability('principal_disable')),
-        button(text('颁发 / 替换入口 token',
-            'Issue / rotate gateway token'),
-          ()=> {
-          },
-          '',
-          true));
-      append(p,
-        actions,
-        el('p',
-          text('入口生命周期：仅离线维护。新增用户需要尚未实现的拓扑迁移。',
-            'Entry lifecycle: offline maintenance only. New users require topology migration support.'),
-          'capability'));
-      const b=panel(text('服务凭据绑定',
-          'Provider credential bindings'),
-        text('只显示元数据，不读取秘密。凭据保存、目录发现和认证健康是不同状态。',
-          'Metadata only; secrets are never read back. Stored credentials, catalog discovery and authentication health are distinct.'));
-      if(!u.bindings?.length)empty(b,
-        '尚无绑定记录。可显式启用本机 CLI 合成绑定；原生客户端集成尚未验证。',
-        'No binding records. Opt-in local CLI synthetic binding is available; native client integration is unverified.');
-      else b.appendChild(table([text('服务',
-              'Service'),
-            text('存储状态',
-              'Stored state'),
-            text('代次',
-              'Generation'),
-            text('到期',
-              'Expires'),
-            text('已发现工具 / 认证健康',
-              'Discovered tools / auth health'),
-            text('操作',
-              'Action')],
-          u.bindings.map(x=>[x.system,
-              bindingState(x.state),
-              x.generation,
-              timestamp(x.expires_at),
-              (u.tools||[]).filter(t=>t.system===x.system).length+' / '+text('未检查',
-                'Not checked'),
-              button(text('预览撤销',
-                  'Preview revoke'),
-                ()=>mutate( {
-                    action:'revoke_binding',
-                    tenant:u.tenant,
-                    principal:u.principal,
-                    system:x.system,
-                    expected_version:x.generation
-                  },
-                  false),
-                'danger',
-                state.busy||!capability('binding_revoke')||x.state==='revoked')])));
+      const p=panel(text('身份与入口凭证','Identity & gateway credential'));
+      const u=userPicker(p);c.appendChild(p);if(!u)return;
+      const entry=u.entry;
+      const expired=entry?.expires_at&&!entry.expires_at.startsWith('0001-')&&new Date(entry.expires_at).getTime()<=Date.now();
+      const entryState=!entry?text('未提供入口信息','Entry information unavailable'):entry.revoked?text('已撤销','Revoked'):expired?text('已到期','Expired'):text('未撤销；完整可用性未确认','Not revoked; full usability unconfirmed');
+      append(p,table([text('租户 / 身份','Tenant / identity'),text('身份状态','Identity state'),text('入口凭证版本','Gateway credential version'),text('入口凭证状态','Gateway credential state'),text('到期时间','Expiry')],
+        [[u.tenant+' / '+u.principal,badge(u.disabled?text('已禁用','Disabled'):text('允许使用网关（仍需通过认证与授权）','Enabled (authentication and authorization still required)'),u.disabled?'bad':''),entry?.generation??'—',entryState,timeDetail(entry?.expires_at,true)]]),
+        help(text('如何颁发或替换入口凭证？','How do I issue or rotate gateway credentials?'),text('使用受信离线维护流程。此管理台不显示或生成入口秘密；新增用户仍需要拓扑迁移支持。','Use trusted offline maintenance. This console does not display or generate entry secrets; new users require topology migration support.')));
+      const b=panel(text('服务凭据绑定','Provider credential bindings'),text('仅显示元数据。凭据已保存不等于认证有效，目录也不是实时健康检查。','Metadata only. Stored credentials do not prove authentication; catalogs are not live health checks.'));
+      if(!u.bindings?.length)empty(b,'尚无绑定记录。可显式启用本机 CLI 合成绑定；原生客户端集成尚未验证。','No binding records. Opt-in local CLI synthetic binding is available; native client integration is unverified.');
+      else b.appendChild(table([text('服务','Service'),text('凭据状态','Credential state'),text('凭证版本','Credential version'),text('到期','Expires'),text('已发现工具','Discovered tools')],u.bindings.map(x=>[x.system,bindingState(x.state),x.generation,timeDetail(x.expires_at,true),(u.tools||[]).filter(t=>t.system===x.system).length])));
       c.appendChild(b);
-      confirmation(c);
+      const danger=panel(text('危险操作','Danger zone'),text('禁用身份将阻止其继续使用网关，当前页面无法重新启用。撤销绑定将移除此身份对应服务的凭据。操作均需预览并再次确认。','Disabling blocks gateway access and cannot be undone here. Revoking a binding removes this identity’s credential for that service. Both require preview and explicit confirmation.'));
+      danger.classList.add('danger-zone');
+      append(danger,button(text('预览禁用此用户','Preview disabling user'),()=>mutate({action:'disable_principal',tenant:u.tenant,principal:u.principal,expected_version:u.policy_version},false),'danger',state.busy||u.disabled||!capability('principal_disable')));
+      (u.bindings||[]).forEach(x=>danger.appendChild(button(text('预览撤销','Preview revoke')+' · '+x.system,()=>mutate({action:'revoke_binding',tenant:u.tenant,principal:u.principal,system:x.system,expected_version:x.generation},false),'danger',state.busy||!capability('binding_revoke')||x.state==='revoked')));
+      c.appendChild(danger);confirmation(c);
+    }
+    function policyNames(u) {
+      return [...new Set((state.policyDraft??(u.allowed||[]).join('\n')).split(/\r?\n/).map(x=>x.trim()).filter(Boolean))];
+    }
+    function policyDiff(parent, u, selected) {
+      const before=u.allowed||[];
+      const added=selected.filter(n=>!before.includes(n)), removed=before.filter(n=>!selected.includes(n));
+      append(parent,el('p',text('已选 '+selected.length+' 项 · 新增 '+added.length+' · 移除 '+removed.length,'Selected '+selected.length+' · Added '+added.length+' · Removed '+removed.length)));
+      if(added.length)append(parent,el('h3',text('新增授权','Added access')),el('pre',added.join('\n')));
+      if(removed.length)append(parent,el('h3',text('移除授权','Removed access')),el('pre',removed.join('\n')));
     }
     function renderPolicy(c) {
-      const p=panel(text('明确工具白名单',
-          'Explicit tool allowlist'));
-      const u=userPicker(p);
-      c.appendChild(p);
-      if(!u)return;
-      if(!capability('policy_update'))p.appendChild(note('当前后端未开放策略修改。',
-          'Policy editing is not available in this backend.'));
-      const label=el('label',
-        text('完整工具名，每行一个，例如 crm__read（空列表撤回全部工具授权）',
-          'Exact tool names, one per line, e.g. crm__read (empty removes all tool access)'));
-      label.htmlFor='policy-allowed';
-      const area=el('textarea');
-      area.id='policy-allowed';
-      area.value=state.policyDraft??(u.allowed||[]).join('\n');
-      area.disabled=state.busy||!capability('policy_update');
-      area.addEventListener('input',
-        ()=> {
-          state.viewRevision++;
-          state.policyDraft=area.value;
-          state.preview=null;
-          $('mutation-confirmation')?.remove()
-      });
-      append(p,
-        el('p',
-          text('当前策略版本：',
-            'Current policy version: ')+u.policy_version),
-        label,
-        area,
-        button(text('预览授权变更',
-            'Preview access change'),
-          ()=> {
-            const allowed=area.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
-            mutate( {
-                action:'set_policy',
-                tenant:u.tenant,
-                principal:u.principal,
-                expected_version:u.policy_version,
-                allowed
-              },
-              false)
-          },
-          'primary',
-          state.busy||!capability('policy_update')));
-      const catalog=panel(text('此身份的已发现工具',
-          'Discovered tools for this identity'));
-      if(!u.tools?.length)empty(catalog,
-        '尚无已发现工具。可能缺少凭据或尚未发现，不等于没有授权。',
-        'No discovered tools. Credentials may be missing or discovery pending; this does not mean no access is granted.');
-      else catalog.appendChild(table([text('工具',
-              'Tool'),
-            text('服务',
-              'Service'),
-            text('授权',
-              'Access')],
-          u.tools.map(t=>[t.name,
-              t.system,
-              badge(t.authorized?text('明确允许',
-                  'Allowed'):text('未授权',
-                  'Not allowed'),
-                t.authorized?'good':'')])));
-      c.appendChild(catalog);
-      confirmation(c);
+      const p=panel(text('工具授权','Tool access'),text('搜索与勾选仅修改本地草稿；先预览差异，再确认提交。','Search and selection only edit a local draft; preview changes before confirming.'));
+      const u=userPicker(p);c.appendChild(p);if(!u)return;
+      const disabled=state.busy||!capability('policy_update');
+      if(!capability('policy_update'))p.appendChild(note('当前后端未开放策略修改。','Policy editing is not available in this backend.'));
+      const searchLabel=el('label',text('搜索工具或服务','Search tools or services'));
+      searchLabel.htmlFor='policy-search';
+      const search=el('input');search.id='policy-search';search.type='search';search.value=state.policySearch;
+      const list=el('div');list.id='policy-tools';
+      const diff=el('div');diff.id='policy-diff';diff.setAttribute('aria-live','polite');
+      const advanced=el('details');
+      append(advanced,el('summary',text('高级：编辑完整工具名','Advanced: edit exact tool names')));
+      const label=el('label',text('每行一个完整工具名；空列表移除全部授权。','One exact tool name per line; an empty list removes all access.'));label.htmlFor='policy-allowed';
+      const area=el('textarea');area.id='policy-allowed';area.value=state.policyDraft??(u.allowed||[]).join('\n');area.disabled=disabled;
+      function changed() {
+        state.viewRevision++;state.preview=null;$('mutation-confirmation')?.remove();
+        diff.replaceChildren();policyDiff(diff,u,policyNames(u));
+      }
+      function renderTools() {
+        list.replaceChildren();
+        const selected=policyNames(u), known=u.tools||[], query=state.policySearch.trim().toLowerCase();
+        const groups=new Map();
+        known.forEach(t=>{if(!groups.has(t.system))groups.set(t.system,[]);groups.get(t.system).push(t.name);});
+        const absent=[...new Set([...(u.allowed||[]),...selected])].filter(n=>!known.some(t=>t.name===n));
+        if(absent.length)groups.set(null,absent);
+        let matches=0;
+        groups.forEach((names,system)=> {
+          const visible=names.filter(name=>(name+' '+(system||'')).toLowerCase().includes(query));
+          if(!visible.length)return;matches+=visible.length;
+          const group=el('fieldset'),title=el('legend',system??text('未发现目录中的授权（保留）','Access absent from discovery (retained)'));
+          group.appendChild(title);
+          if(system===null)group.appendChild(el('p',text('目录缺失不会删除已有授权。取消勾选才会在确认后移除。','Missing discovery never removes existing access. Uncheck and confirm to remove it.'),'muted'));
+          visible.forEach(name=> {
+            const row=el('label',undefined,'tool-option'),box=el('input');box.type='checkbox';box.checked=selected.includes(name);box.disabled=disabled;
+            box.addEventListener('change',()=> {
+              const values=new Set(policyNames(u));if(box.checked)values.add(name);else values.delete(name);
+              state.policyDraft=[...values].join('\n');area.value=state.policyDraft;changed();
+            });
+            append(row,box,el('span',name));group.appendChild(row);
+          });list.appendChild(group);
+        });
+        if(!matches)empty(list,'没有匹配工具。已有选择仍保留；可调整搜索或使用高级模式。','No matching tools. Existing selection is retained; change the search or use advanced mode.');
+      }
+      search.addEventListener('input',()=>{state.policySearch=search.value;renderTools();});
+      area.addEventListener('input',()=>{state.policyDraft=area.value;changed();renderTools();});
+      append(advanced,label,area);
+      append(p,el('p',text('当前策略版本：','Current policy version: ')+u.policy_version),searchLabel,search,list,diff,advanced,
+        button(text('预览授权变更','Preview access change'),()=>mutate({action:'set_policy',tenant:u.tenant,principal:u.principal,expected_version:u.policy_version,allowed:policyNames(u)},false),'primary',disabled));
+      renderTools();policyDiff(diff,u,policyNames(u));confirmation(c);
     }
     async function loadAudit() {
       if(state.busy)return;
@@ -853,7 +761,7 @@
                 'Result'),
               text('耗时',
                 'Duration')],
-            state.audit.events.map(e=>[e.time+' / '+e.sequence,
+            state.audit.events.map(e=>[append(el('div'),timeDetail(e.time),el('small',String(e.sequence))),
                 e.action+' / '+e.phase,
                 e.outcome_unknown?text('结果未知，不自动重放',
                   'Unknown outcome; no automatic replay'):e.result_class+(e.tool_is_error?text(' · 工具业务错误',
@@ -867,9 +775,7 @@
         text('仅当前进程观察范围，重启清零。HTTP 与操作计数单位不同，不相加为总请求量。',
           'Current-process observations only; resets on restart. HTTP and operation counts have different units and cannot be added into total requests.'));
       if(r)append(q,
-        el('p',
-          text('观察起点：',
-            'Observation start: ')+timestamp(r.Started)),
+        append(el('div'), el('span',text('观察起点：','Observation start: ')),timeDetail(r.Started)),
         table([text('范围 / 类别',
               'Scope / category'),
             text('次数',
@@ -892,7 +798,7 @@
                     'Invalid request',
                     'Unavailable'][i]),
                 x.Count,
-                timestamp(x.Last),
+                timeDetail(x.Last),
                 x.Saturated?text('是',
                   'Yes'):text('否',
                   'No')]),
@@ -907,7 +813,7 @@
                     'Admission',
                     'Protocol'][i]),
                 x.Count,
-                timestamp(x.Last),
+                timeDetail(x.Last),
                 x.Saturated?text('是',
                   'Yes'):text('否',
                   'No')])]));
@@ -918,10 +824,10 @@
     }
     // The structured form builds a local draft. Validation deliberately cannot apply or restart.
     function renderConfig(c) {
-      const p=panel(text('接入配置草稿',
-          'Service configuration draft'),
-        text('编辑系统配置 JSON，不能包含 token 或凭据。仅在当前页面内存保留。',
-          'Edit service configuration JSON without tokens or credentials. Kept only in page memory.'));
+      const p=panel(text('生成并校验配置草稿 · 未应用',
+          'Generate and validate configuration draft · Not applied'),
+        text('从当前配置生成本地草稿。此页不能在线接入、保存生效或重启；静态校验只检查格式与规则。不能包含 token 或凭据，草稿仅在页面内存保留。',
+          'Prepare a local draft from running configuration. This page cannot connect, apply or restart; validation checks static rules only. No tokens or credentials. Page memory only.'));
       const fields=el('div',
         undefined,
         'fields');
@@ -1010,11 +916,13 @@
               endpoint,
               auth,
               network,
-              quota_subject
+              quota_subject,
+              timeouts
           })=>( {
               name,
               endpoint,
               auth,
+              ...(timeouts? {timeouts}: {}),
               ...(network? {
                   network
                 }
@@ -1128,17 +1036,7 @@
       c.appendChild(p);
       const maintenance=panel(text('应用与维护边界',
           'Application & maintenance boundaries'));
-      append(maintenance,
-        button(text('应用配置 / 重启',
-            'Apply configuration / restart'),
-          ()=> {
-          },
-          '',
-          true),
-        el('p',
-          text('不可用：尚无受控应用执行器与拓扑迁移。入口替换/撤销、根密钥轮换和审计归档使用现有受信离线流程。',
-            'Unavailable: controlled apply and topology migration are not implemented. Use trusted offline workflows for entry lifecycle, root-key rotation and audit archival.'),
-          'capability'));
+      maintenance.appendChild(help(text('如何应用配置或重启？','How do I apply configuration or restart?'),text('当前没有受控应用执行器与拓扑迁移，不能在线应用此草稿。入口替换/撤销、根密钥轮换和审计归档使用受信离线流程。不要覆盖数据库或重新初始化绕过迁移。','There is no controlled apply executor or topology migration; this draft cannot be applied online. Use trusted offline workflows for entry lifecycle, root-key rotation and audit archival. Never overwrite or reinitialize the database to bypass migration.')));
       c.appendChild(maintenance);
     }
     $('login-form').addEventListener('submit',
