@@ -21,6 +21,7 @@ var accountAssets embed.FS
 // AccountHandler is an opt-in, loopback-only own-account control surface.
 // expectedOrigin must be supplied by the listener owner, never copied from a request.
 // It does not relax the separate MCP handler's browser restrictions.
+// 静态页面可未登录加载，但绑定 API 每次以入口 bearer 认证，不能选择其他身份。
 func (g *Gateway) AccountHandler(expectedOrigin string) (http.Handler, error) {
 	u, err := url.Parse(expectedOrigin)
 	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Path != "" || u.Opaque != "" || u.Host == "" {
@@ -40,6 +41,7 @@ func (g *Gateway) AccountHandler(expectedOrigin string) (http.Handler, error) {
 			accountError(w, http.StatusForbidden, "request_denied")
 			return
 		}
+		// 浏览器请求受同源约束；无浏览器元数据的本地客户端仍必须通过后续 bearer 认证。
 		origin := r.Header.Get("Origin")
 		site := r.Header.Get("Sec-Fetch-Site")
 		if (origin != "" && origin != expectedOrigin) || (site != "" && site != "same-origin" && site != "none") || (r.Method == http.MethodPost && site != "" && origin != expectedOrigin) {
@@ -174,6 +176,7 @@ func (g *Gateway) AccountHandler(expectedOrigin string) (http.Handler, error) {
 			accountFailure(w, err)
 			return
 		}
+		// 变更到这里已成功提交；后续发现失败只影响可用目录，不能把它报成保存失败。
 		result := struct {
 			Binding accountBinding     `json:"binding"`
 			Hint    string             `json:"hint"`
@@ -217,6 +220,8 @@ type accountBinding struct {
 	Hint       string       `json:"hint,omitempty"`
 }
 
+// accountBindingView 将本地到期映射为展示状态，不写回绑定状态，也不探测提供方。
+// active 只说明本地保存了凭据，不能推断远端仍接受它。
 func accountBindingView(b BindingInfo) accountBinding {
 	v := accountBinding{System: b.System, Generation: b.Generation, State: b.State}
 	if !b.ExpiresAt.IsZero() {
@@ -266,7 +271,8 @@ func accountFailure(w http.ResponseWriter, err error) {
 	}
 }
 
-// Decode a bounded single JSON object and reject duplicate/unknown field ambiguity.
+// decodeAccountObject 解码有界单一对象并拒绝顶层重复键；字段名及值类型由
+// 各路由按自己的协议再验证，未知字段不能仅靠本函数拒绝。
 func decodeAccountObject(w http.ResponseWriter, r *http.Request) (map[string]json.RawMessage, error) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
 	start, err := decoder.Token()

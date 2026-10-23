@@ -91,6 +91,9 @@ func NewPersistent(cfg Config, opts PersistenceOptions) (*Gateway, error) {
 	}
 	return newPersistent(cfg, opts, false)
 }
+
+// OpenMaintenance 打开既有存储供可信离线维护使用，禁止同时初始化新库。
+// 仅显式 Migrate 时允许认证旧版本后升级；维护实例不提供在线业务服务。
 func OpenMaintenance(cfg Config, opts PersistenceOptions) (*Gateway, error) {
 	if opts.Initialize {
 		return nil, ErrStorage
@@ -156,6 +159,8 @@ func newPersistent(cfg Config, opts PersistenceOptions, maintenance bool) (*Gate
 	if err != nil {
 		return nil, ErrStorage
 	}
+	// 拓扑摘要绑定系统配置及身份映射，而非可变策略/凭据；重开时拒绝悄悄
+	// 更换路由或身份范围，动态状态则从存储恢复，不能被配置种子覆盖。
 	identities := map[string]Identity{}
 	for id, p := range g.principals {
 		identities[id] = p.identity
@@ -222,6 +227,8 @@ CREATE TABLE audit(sequence INTEGER PRIMARY KEY,event TEXT NOT NULL,mac TEXT NOT
 CREATE TABLE principals(user_id TEXT PRIMARY KEY,tenant TEXT NOT NULL,principal TEXT NOT NULL,token_hash BLOB NOT NULL,token_expires_at TEXT NOT NULL,policy_version INTEGER NOT NULL,disabled INTEGER NOT NULL,allowed TEXT NOT NULL,entry_generation INTEGER NOT NULL,entry_revoked INTEGER NOT NULL,entry_strong INTEGER NOT NULL,UNIQUE(tenant,principal));
 CREATE TABLE bindings(user_id TEXT NOT NULL REFERENCES principals(user_id),system TEXT NOT NULL,binding_id TEXT NOT NULL UNIQUE,generation INTEGER NOT NULL,state TEXT NOT NULL,expires_at TEXT NOT NULL,credential BLOB NOT NULL,PRIMARY KEY(user_id,system));`
 
+// bindingAAD 将密文与用户键和完整绑定元数据关联；挪用到另一绑定、代次或
+// 状态时解密不再匹配。该编码属于持久认证格式，不能随展示需求调整。
 func bindingAAD(id string, p *principalState, b *bindingRecord) []byte {
 	data, _ := json.Marshal(struct {
 		User    string
@@ -255,6 +262,9 @@ func sortedBindingNames(bindings map[string]*bindingRecord) []string {
 func (s *sqliteStore) stateMAC(records map[string]storedPrincipal) []byte {
 	return s.stateMACAt(records, s.auditSequence, s.auditHead)
 }
+
+// stateMACAt 先按用户键稳定排序，再认证记录和审计检查点；不能依赖 Go map
+// 遍历顺序，否则同一逻辑状态重启后会得到不同的认证输入。
 func (s *sqliteStore) stateMACAt(records map[string]storedPrincipal, sequence uint64, head string) []byte {
 	ids := make([]string, 0, len(records))
 	for id := range records {
@@ -436,6 +446,8 @@ func (s *sqliteStore) load(ctx context.Context, g *Gateway) error {
 	if err != nil || !hmac.Equal(mac, s.stateMAC(s.records)) {
 		return ErrStorage
 	}
+	// 行结构与整体状态 MAC 都通过后才解密凭据、重建身份；构造期间失败的
+	// 网关不会返回给调用方，不能退回配置中的旧凭据继续启动。
 	restored := map[string]*principalState{}
 	for id, r := range s.records {
 		if len(r.Bindings) != len(g.systems) {
@@ -501,6 +513,8 @@ func (s *sqliteStore) persist(g *Gateway, id string, p *principalState, event Au
 	return nil
 }
 
+// clonePrincipal 复制所有会被变更路径写入的容器和绑定记录；候选状态可独立
+// 修改，提交失败不会泄漏部分更新到当前身份。字符串和值类型直接复用。
 func clonePrincipal(p *principalState) *principalState {
 	copy := *p
 	copy.allowed = append([]string(nil), p.allowed...)
@@ -511,6 +525,9 @@ func clonePrincipal(p *principalState) *principalState {
 	}
 	return &copy
 }
+
+// publishPrincipalLocked 要求持有 g.mu；持久模式下状态与审计先一起提交，再发布身份、
+// 失效目录并取消旧操作。该锁与最终调用准入共享，使撤权和新准入有明确先后。
 func (g *Gateway) publishPrincipalLocked(id string, p *principalState, system string, action AuditAction, own bool) error {
 	if !g.auditRoomLocked(1) {
 		return ErrAuditFull
@@ -568,6 +585,8 @@ func (g *Gateway) Close() error {
 		op.cancel()
 	}
 	g.mu.Unlock()
+	// 等待时不能持有 g.mu：操作结束仍需取得该锁写终态审计。上面的五秒
+	// 上下文限制关闭期间的审计 I/O，不是 Wait 的硬超时或下游回滚保证。
 	g.operationWG.Wait()
 	g.mu.Lock()
 	defer g.mu.Unlock()

@@ -160,6 +160,18 @@ func newRevocationGateway(t *testing.T, f *revocationFixture) *gateway.Gateway {
 func assertRevocationDenied(t *testing.T, ctx context.Context, g *gateway.Gateway, f *revocationFixture, id string) {
 	t.Helper()
 	before := f.requests.Load()
+	assertRevocationDeniedCall(t, ctx, g, f, id)
+	if got := f.requests.Load(); got != before {
+		t.Fatalf("denied request contacted downstream: before=%d after=%d", before, got)
+	}
+}
+
+// During an already-running refresh, other authorized identities may still make
+// discovery requests. Denial must prevent business dispatch, not that unrelated
+// traffic. The caller retains the full transport assertion after refresh exits.
+func assertRevocationDeniedCall(t *testing.T, ctx context.Context, g *gateway.Gateway, f *revocationFixture, id string) {
+	t.Helper()
+	before := f.calls.Load()
 	if names := g.Names(id); len(names) != 0 {
 		t.Fatalf("revoked identity lists tools: %v", names)
 	}
@@ -167,8 +179,8 @@ func assertRevocationDenied(t *testing.T, ctx context.Context, g *gateway.Gatewa
 	if !errors.Is(err, gateway.ErrDenied) || result != nil {
 		t.Fatalf("revoked call result=%v error=%v", result, err)
 	}
-	if got := f.requests.Load(); got != before {
-		t.Fatalf("denied request contacted downstream: before=%d after=%d", before, got)
+	if got := f.calls.Load(); got != before {
+		t.Fatalf("denied request dispatched a business call: before=%d after=%d", before, got)
 	}
 }
 func assertRevocationIdentity(t *testing.T, ctx context.Context, g *gateway.Gateway, id, want string) {
@@ -300,7 +312,7 @@ func TestRevocationSlowDiscoveryCannotRepublish(t *testing.T) {
 			go func() { g.Refresh(ctx); close(finished) }()
 			barrier.wait(t, ctx)
 			mutation.apply(t, g)
-			assertRevocationDenied(t, ctx, g, f, "east-user")
+			assertRevocationDeniedCall(t, ctx, g, f, "east-user")
 			barrier.open()
 			select {
 			case <-finished:

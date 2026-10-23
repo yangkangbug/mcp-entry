@@ -21,6 +21,11 @@ jobs:
         run: test -z "$(gofmt -l cmd internal)"
       - name: Verify dependencies
         run: go mod download && go mod verify
+      - name: Check admin console state and syntax
+        run: |
+          node --version
+          node --check internal/gateway/admin_assets/admin.js
+          node tests/admin-console/frontend.test.cjs
       - name: Test
         run: go test -count=1 ./...
       - name: Test with race detector

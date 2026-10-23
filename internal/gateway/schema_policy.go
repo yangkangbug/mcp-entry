@@ -88,9 +88,10 @@ type schemaPolicyNode struct {
 	children []*schemaPolicyNode
 	ref      string
 	hasRef   bool
-	state    uint8
-	work     int
-	height   int
+	// DFS 状态：0 未访问，1 当前递归栈内，2 成本与高度已计算。
+	state  uint8
+	work   int
+	height int
 }
 
 type schemaPolicyGraph struct {
@@ -132,6 +133,8 @@ func analyzeSchema(value any) (int, error) {
 	if graph.refs > 0 && (graph.hasID || graph.hasNestedDialect) {
 		return 0, errors.New("reference-bearing schemas cannot contain $id or nested $schema")
 	}
+	// 先完成全部 schema 位置索引再连接引用，允许前向引用；
+	// 目标必须是受支持的 schema 位置，而不是任意可寻址的 JSON 值。
 	for _, node := range graph.index {
 		if node.hasRef {
 			target := graph.index[node.ref]
@@ -144,6 +147,8 @@ func analyzeSchema(value any) (int, error) {
 	return expandedSchemaBudget(root)
 }
 
+// add 同时用于结构筛选和完整准入；structuralOnly 跳过表达式与引用解释，
+// 但两条路径都只沿已知 schema 容器建立节点，不把描述或扩展数据当成 schema。
 func (g *schemaPolicyGraph) add(value any, path string) (*schemaPolicyNode, error) {
 	if len(g.index) >= MaxSchemaNodes {
 		return nil, errors.New("schema node limit exceeded")
@@ -318,6 +323,7 @@ func expandedSchemaBudget(node *schemaPolicyNode) (int, error) {
 	case 1:
 		return 0, errors.New("schema reference cycle unsupported")
 	case 2:
+		// 复用计算结果但不免除父节点的累加，重复引用仍消耗展开预算。
 		return node.work, nil
 	}
 	node.state = 1
@@ -352,6 +358,7 @@ func validateInstanceBudget(value any, schemaWork int) error {
 	if err != nil {
 		return errors.New("instance JSON budget exceeded or invalid JSON shape")
 	}
+	// 用除法比较乘积上限，避免先计算 nodes * schemaWork 带来的溢出风险。
 	if nodes > MaxValidationWork/schemaWork {
 		return errors.New("validation work limit exceeded")
 	}

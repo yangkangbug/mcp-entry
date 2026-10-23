@@ -34,6 +34,7 @@ func (g *Gateway) migrateStorage(ctx context.Context) error {
 	if !g.auditRoomLocked(1) {
 		return ErrAuditFull
 	}
+	// 迁移只在候选状态上改版本和记录；数据库提交后才整体替换当前 store。
 	candidate := *s
 	candidate.version = 4
 	candidate.records = make(map[string]storedPrincipal, len(s.records))
@@ -46,6 +47,7 @@ func (g *Gateway) migrateStorage(ctx context.Context) error {
 	if len(g.auditIDKey) != 32 {
 		return ErrStorage
 	}
+	// v2 没有持久审计链；v3 已有的链和标识密钥必须继续沿用。
 	if s.version == 2 {
 		candidate.auditSequence, candidate.auditHead = 0, ""
 		candidate.auditIDCipher = candidate.aead.Seal(nil, nil, g.auditIDKey, candidate.auditIDAAD())
@@ -158,6 +160,7 @@ func (g *Gateway) RotateKey(newKey []byte) error {
 	}
 	candidate.auditIDCipher = candidate.aead.Seal(nil, nil, g.auditIDKey, candidate.auditIDAAD())
 	candidate.records = make(map[string]storedPrincipal, len(s.records))
+	// 复制绑定切片后再重加密，避免候选状态的写入污染仍使用旧密钥的记录。
 	for id, r := range s.records {
 		r.Bindings = append([]storedBinding(nil), r.Bindings...)
 		for i := range r.Bindings {
@@ -198,6 +201,7 @@ func (g *Gateway) RotateKey(newKey []byte) error {
 		mac      string
 	}
 	rewritten := make([]rewrittenAudit, 0)
+	// 已归档前缀不重写；从保留的归档锚点开始，用旧密钥验链、用新密钥续链。
 	previous, next := s.auditBaseHead, s.auditBaseHead
 	count := s.auditBaseSequence
 	for rows.Next() {
@@ -268,6 +272,8 @@ func (g *Gateway) RotateKey(newKey []byte) error {
 	return nil
 }
 
+// maintenanceUpdatedOne 将未命中或异常影响行数也视为失败，避免把缺失元数据
+// 或缺失审计行误当作成功的迁移/轮换。
 func maintenanceUpdatedOne(result sql.Result, err error) bool {
 	if err != nil || result == nil {
 		return false

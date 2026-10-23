@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
+// IngressMaxHeaderBytes 是解析后头部的入口预算；宿主仍须限制原始 HTTP 头。
 const IngressMaxHeaderBytes = 16 << 10
+
+// IngressReadTimeout 是入口读取预算；请求已有更早截止时间时不将其延长。
 const IngressReadTimeout = 15 * time.Second
 
 // IngressConfig is separate from downstream admission; zero fields use defaults.
@@ -38,6 +41,9 @@ func newIngressLimiter(cfg IngressConfig, identities []Identity) (*ingressLimite
 	}
 	return l, nil
 }
+
+// acquire 仅结算一个入口桶；与出站多桶原子准入不同，全局与身份桶分步扣费。
+// 返回的释放函数可重复调用，只归还并发槽，不返还已消耗的速率令牌。
 func (l *ingressLimiter) acquire(b *admissionBucket) (func(), bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -68,6 +74,8 @@ type ingressScope struct{ gateway *Gateway }
 // does not support ResponseController deadlines. No read goroutine is spawned.
 func (g *Gateway) GuardHTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 同一网关的路由可再次包装 GuardHTTP，但一个请求只能计费一次。
+		// 标记携带网关指针，不能替另一个网关实例跳过入口保护。
 		if scope, ok := r.Context().Value(ingressContextKey{}).(*ingressScope); ok && scope.gateway == g {
 			next.ServeHTTP(w, r)
 			return
@@ -103,6 +111,7 @@ func (g *Gateway) GuardHTTP(next http.Handler) http.Handler {
 			http.Error(w, "request headers too large", http.StatusRequestHeaderFieldsTooLarge)
 			return
 		}
+		// 未认证请求只计入全局桶，不按任意输入创建桶；真正的认证由路由执行。
 		if identity, valid := g.authenticateEntry(r); valid {
 			releasePrincipal, admitted := g.ingress.acquire(g.ingress.principals[identity])
 			if !admitted {
@@ -117,6 +126,7 @@ func (g *Gateway) GuardHTTP(next http.Handler) http.Handler {
 		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 		observer := &rejectionWriter{ResponseWriter: w, summary: &g.rejections}
 		var wrapped http.ResponseWriter = observer
+		// 仅在底层支持时暴露 Flusher，既保留流式响应能力，也不伪造可选接口。
 		if _, ok := w.(http.Flusher); ok {
 			wrapped = &flushingRejectionWriter{observer}
 		}
@@ -131,6 +141,8 @@ type rejectionWriter struct {
 }
 
 func (w *rejectionWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// WriteHeader 只统计第一个最终响应；1xx 不是最终结果，重复写头不重复计数。
 func (w *rejectionWriter) WriteHeader(status int) {
 	if !w.wrote && status >= 200 {
 		w.wrote = true

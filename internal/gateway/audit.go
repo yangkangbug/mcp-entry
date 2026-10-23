@@ -122,6 +122,8 @@ func AuditIdentifier(key []byte, kind, value string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+// ValidateAuditEvent 校验有界字段及已定义的阶段/结果约束，不验证 MAC 或事件来源。
+// 序号由写入方分配；需要认证链的调用方应继续使用 AuditMAC 或 VerifyAuditMAC。
 func ValidateAuditEvent(e AuditEvent) error {
 	if e.ArchivedUnfinished > math.MaxInt64 || (e.ArchivedUnfinished > 0 && (e.Action != AuditActionStorageArchive || e.Phase != AuditPhaseCommit || e.Result != AuditResultSuccess)) {
 		return ErrAuditInvalid
@@ -193,6 +195,8 @@ func AuditMAC(key []byte, previous string, e AuditEvent) (string, error) {
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
+// VerifyAuditMAC 验证单条事件与给定前驱的认证关系；调用方仍需检查连续序号
+// 以及最终链头是否与经过认证的状态清单一致。
 func VerifyAuditMAC(key []byte, previous string, e AuditEvent, expected string) error {
 	got, err := AuditMAC(key, previous, e)
 	if err != nil || !auditDigest(expected) || !hmac.Equal([]byte(got), []byte(expected)) {
@@ -201,12 +205,17 @@ func VerifyAuditMAC(key []byte, previous string, e AuditEvent, expected string) 
 	return nil
 }
 
+// AuditFilter 使用已脱敏的标识作精确筛选；空标识表示不限制该维度。
+// After 是不包含自身的序号游标，不是数组下标；Limit 为零时读取默认页大小。
 type AuditFilter struct {
 	IdentityID string
 	SystemID   string
 	After      uint64
 	Limit      int
 }
+
+// AuditPage 的 Dropped 与 LastSequence 属于整个日志环，不随筛选条件改变。
+// LastSequence 是快照时的全局高水位，不一定是本页最后一条事件的序号。
 type AuditPage struct {
 	Events       []AuditEvent `json:"events"`
 	Dropped      uint64       `json:"dropped"`
@@ -242,6 +251,9 @@ func NewAuditRing(capacity int) (*AuditRing, error) {
 	}
 	return &AuditRing{capacity: capacity, events: make([]AuditEvent, 0, capacity)}, nil
 }
+
+// Append 验证后分配新序号，忽略传入的 Sequence；满容量时覆盖最旧记录。
+// 它只更新内存环，不替调用方提交持久日志事务。
 func (r *AuditRing) Append(e AuditEvent) error {
 	if err := ValidateAuditEvent(e); err != nil {
 		return err
@@ -262,6 +274,8 @@ func (r *AuditRing) Append(e AuditEvent) error {
 	}
 	return nil
 }
+
+// Read 返回按序号递增的事件副本；空页也携带当前全局序号和淘汰数量。
 func (r *AuditRing) Read(f AuditFilter) (AuditPage, error) {
 	if err := ValidateAuditFilter(f); err != nil {
 		return AuditPage{}, err
@@ -275,6 +289,7 @@ func (r *AuditRing) Read(f AuditFilter) (AuditPage, error) {
 	p := AuditPage{Events: make([]AuditEvent, 0), Dropped: r.dropped, LastSequence: r.sequence}
 	for i := 0; i < len(r.events); i++ {
 		index := i
+		// 环已满时 next 同时指向下一次覆盖位置和当前最旧事件。
 		if len(r.events) == r.capacity {
 			index = (r.next + i) % r.capacity
 		}

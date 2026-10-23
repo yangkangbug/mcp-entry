@@ -14,6 +14,9 @@ type discoveryKey struct{ user, system string }
 func bindingUsable(b *bindingRecord) bool {
 	return b.info.State == BindingActive && b.credential != "" && (b.info.ExpiresAt.IsZero() || time.Now().Before(b.info.ExpiresAt))
 }
+
+// principalUsableLocked 是在线可用性检查：维护实例、关闭、禁用、入口撤销
+// 或到期均拒绝。它不检查某个下游绑定和工具许可。
 func (g *Gateway) principalUsableLocked(id string) bool {
 	p := g.principals[id]
 	if g.closed || g.maintenance || p == nil || p.disabled || p.entry.Revoked {
@@ -22,6 +25,9 @@ func (g *Gateway) principalUsableLocked(id string) bool {
 	expiry := g.users[id].TokenExpiresAt
 	return expiry.IsZero() || time.Now().Before(expiry)
 }
+
+// authenticateEntry 每次从当前摘要表验证 bearer 并检查身份可用性；
+// 不把会话 ID、请求中的用户字段或先前认证结果当作后续请求的凭据。
 func (g *Gateway) authenticateEntry(r *http.Request) (Identity, bool) {
 	if len(r.Header.Values("Authorization")) != 1 {
 		return Identity{}, false
@@ -55,6 +61,7 @@ func (g *Gateway) validateAccountAuth() error {
 }
 
 // AccountBindings exposes only this configured identity's binding metadata.
+// Identity 仍须由调用方从已认证请求取得；本方法检查可用性但不证明来访者身份。
 func (g *Gateway) AccountBindings(identity Identity) ([]BindingInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -133,6 +140,7 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 		g.mu.Unlock()
 		return discoveryFailure(id, system, "audit unavailable", err)
 	}
+	// 抓取同一锁内的授权版本与凭据供本次发现使用，锁外网络结果不能直接发布。
 	generation, version, token := b.info.Generation, p.version, b.credential
 	key := discoveryKey{id, system}
 	if previous, ok := g.operations[g.discoveryEpoch[key]]; ok {
@@ -153,6 +161,7 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 	cancel()
 	p = g.principals[id]
 	b = p.bindings[system]
+	// 即使取消未能阻止旧网络请求返回，epoch 和版本比较也阻止它覆盖新状态。
 	if g.discoveryEpoch[key] != opID || g.closed || b.info.Generation != generation || p.version != version {
 		return discoveryFailure(id, system, "discovery superseded", nil)
 	}
@@ -164,6 +173,8 @@ func (g *Gateway) RefreshBinding(ctx context.Context, identity Identity, system 
 			catalog[name] = e
 		}
 	}
+	// 发现失败时只保留其他系统的目录，不回退到本系统旧工具；成功时还需
+	// 逐条检查当前到期/禁用状态，不能仅凭发现开始时的授权快照发布。
 	if err == nil {
 		for name, e := range entries {
 			e.generation, e.policyVersion = generation, version

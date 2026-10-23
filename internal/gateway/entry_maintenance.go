@@ -15,6 +15,8 @@ type EntryInfo struct {
 	Revoked    bool
 }
 
+// Entry 返回可信进程内调用方指定身份的入口元数据，不返回 token 或摘要。
+// Identity 仅用于查找，不替外部调用方完成认证。
 func (g *Gateway) Entry(identity Identity) (EntryInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -24,6 +26,10 @@ func (g *Gateway) Entry(identity Identity) (EntryInfo, error) {
 	}
 	return p.entry, nil
 }
+
+// ReplaceEntry 仅在离线维护模式替换入口 token；expected 必须匹配当前入口代次。
+// token 必须是规范编码的 32 字节值，expiry 必须在未来；成功后旧 token 不再有效。
+// 此操作不恢复已禁用身份，也不改变工具策略或下游绑定。
 func (g *Gateway) ReplaceEntry(identity Identity, expected uint64, token string, expiry time.Time) (EntryInfo, error) {
 	decoded, err := base64.RawURLEncoding.Strict().DecodeString(token)
 	if err != nil || len(decoded) != 32 || base64.RawURLEncoding.EncodeToString(decoded) != token || !validExpiryDate(expiry) || expiry.IsZero() || !expiry.After(time.Now()) {
@@ -32,6 +38,9 @@ func (g *Gateway) ReplaceEntry(identity Identity, expected uint64, token string,
 	digest := entryTokenDigest(token)
 	return g.mutateEntry(identity, expected, &digest, expiry.UTC())
 }
+
+// RevokeEntry 以入口代次作乐观并发检查；撤销只标记入口失效，保留原到期时间。
+// 与替换相同，它要求离线维护实例，不是在线自助注销接口。
 func (g *Gateway) RevokeEntry(identity Identity, expected uint64) (EntryInfo, error) {
 	return g.mutateEntry(identity, expected, nil, time.Time{})
 }
@@ -61,6 +70,8 @@ func (g *Gateway) mutateEntry(identity Identity, expected uint64, digest *[32]by
 	if !g.auditRoomLocked(1) {
 		return EntryInfo{}, ErrAuditFull
 	}
+	// 这里只替换值类型的入口元数据；共享的策略和绑定容器均不写入。
+	// 先构造候选记录，持久事务成功前不发布新的内存身份视图。
 	candidate := *p
 	candidate.entry.Generation++
 	candidate.entry.Revoked = digest == nil
@@ -97,6 +108,9 @@ func (g *Gateway) mutateEntry(identity Identity, expected uint64, digest *[32]by
 	}
 	return candidate.entry, nil
 }
+
+// persistEntry 由持有 g.mu 的维护路径调用，将身份记录、审计事件及状态 MAC
+// 放在同一事务中；提交失败交由调用方关闭实例，不能继续使用旧视图猜测结果。
 func (s *sqliteStore) persistEntry(g *Gateway, id string, r storedPrincipal, event AuditEvent) error {
 	next := make(map[string]storedPrincipal, len(s.records))
 	for k, v := range s.records {
@@ -140,6 +154,8 @@ type legacyStoredPrincipal struct {
 	Bindings                  []storedBinding
 }
 
+// canonicalState 是状态 MAC 的序列化输入，不是可自由调整的展示格式。
+// 旧版本保留原字段布局；调用方负责先固定 records 的顺序。
 func (s *sqliteStore) canonicalState(records []storedPrincipal, sequence uint64, head string) []byte {
 	var encoded []byte
 	if s.version < 4 {

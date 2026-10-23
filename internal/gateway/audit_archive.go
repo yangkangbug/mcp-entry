@@ -116,6 +116,7 @@ func (g *Gateway) ArchiveAudit(path string, expectedSequence uint64) (AuditArchi
 	if g.auditArchivedUnfinished > s.auditSequence || uint64(len(g.auditUnfinished)) > s.auditSequence-g.auditArchivedUnfinished {
 		return result, ErrStorage
 	}
+	// 归档只汇总仍无终态的历史操作，不为它们补造成功、失败或取消结果。
 	doc.ArchivedUnfinished = g.auditArchivedUnfinished + uint64(len(g.auditUnfinished))
 	// Bind the complete export envelope under the current audit key; its SHA256 is
 	// also committed into the independently authenticated live-state manifest.
@@ -136,6 +137,8 @@ func (g *Gateway) ArchiveAudit(path string, expectedSequence uint64) (AuditArchi
 	export = append(export, '\n')
 	digest := sha256.Sum256(export)
 	result = AuditArchiveResult{SHA256: hex.EncodeToString(digest[:]), CoveredCount: doc.CoveredCount, BaseSequence: doc.BaseSequence, LastSequence: doc.LastSequence, CheckpointSequence: doc.LastSequence + 1, ArchivedUnfinished: doc.ArchivedUnfinished}
+	// 文件与 SQLite 不能组成一个事务：先确认导出落盘，再允许裁剪日志。
+	// 后续失败可能留下有效但尚未被检查点引用的文件，不能自动删除或覆盖。
 	if err = writeAuditArchive(path, export); err != nil {
 		return result, ErrStorage
 	}
@@ -163,6 +166,7 @@ func (g *Gateway) ArchiveAudit(path string, expectedSequence uint64) (AuditArchi
 			g.auditFailureLocked()
 		}
 	}()
+	// 裁剪、归档检查点和认证状态清单一起提交，不能单独提交日志删除。
 	if _, err = tx.ExecContext(ctx, "DELETE FROM audit"); err != nil {
 		return result, ErrStorage
 	}
@@ -177,6 +181,7 @@ func (g *Gateway) ArchiveAudit(path string, expectedSequence uint64) (AuditArchi
 		g.auditFailureLocked()
 		return result, ErrArchiveCommitUnknown
 	}
+	// 到这里已确认数据库提交，才发布新的内存日志环和未完成操作累计值。
 	candidate.auditSequence = sequence
 	candidate.auditHead = head
 	*s = candidate
@@ -186,6 +191,8 @@ func (g *Gateway) ArchiveAudit(path string, expectedSequence uint64) (AuditArchi
 	return result, nil
 }
 
+// writeAuditArchive 只创建新私有文件；同步文件及父目录后，再验证路径指向
+// 原文件且内容一致。这是裁剪前检查，不承诺防御之后的文件系统篡改。
 func writeAuditArchive(path string, data []byte) error {
 	if path == "" {
 		return ErrStorage

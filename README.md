@@ -4,7 +4,7 @@ A nonproduction Go MCP gateway: config-driven downstream discovery, per-user too
 
 ## 当前架构
 
-当前是单个 Go 网关进程，使用官方 MCP SDK 与 Streamable HTTP。下图只展示已实现部分；入口与下游默认限回环 HTTP；可显式配置受控 HTTPS 下游，另有独立的 [远程合成测试开关](docs/remote-testing.md) 支持远程 MCP HTTP/HTTPS。配置只使用虚构测试身份与凭证。已实现可选持久化、合成身份本地撤权及显式开启的本人绑定页面；OAuth、真实账号接入与生产密钥管理尚未实现。
+当前是单个 Go 网关进程，使用官方 MCP SDK 与 Streamable HTTP。下图只展示已实现部分；入口与下游默认限回环 HTTP；可显式配置受控 HTTPS 下游，另有独立的 [远程合成测试开关](docs/remote-testing.md) 支持远程 MCP HTTP/HTTPS。配置只使用虚构测试身份与凭证。已实现可选持久化、合成身份本地撤权、显式开启的本地管理控制台与客户端绑定通道；OAuth、真实账号接入与生产密钥管理尚未实现。
 
 ```mermaid
 flowchart TB
@@ -35,7 +35,7 @@ flowchart TB
     Call -->|tools/call · 用户专属凭证| Downstream
 ```
 
-公开工具名采用 `系统名__原工具名`，例如 `crm__echo`；客户端不能用名称或参数改变下游地址。图中的模块是进程内逻辑，不是额外部署的服务。`cmd/demo` 会启动 crm、docs 模拟服务；`cmd/gateway` 只启动网关，下游需预先运行。
+公开业务工具名采用 `系统名__原工具名`，例如 `crm__echo`；客户端不能用名称或参数改变下游地址。显式启用客户端绑定时另有只读控制工具 `mcp_entry_connections`，不接收凭据、不代理业务请求，与业务命名空间分离。图中的模块是进程内逻辑，不是额外部署的服务。`cmd/demo` 会启动 crm、docs 模拟服务；`cmd/gateway` 只启动网关，下游需预先运行。
 
 ## 发现与请求流程
 
@@ -78,7 +78,7 @@ sequenceDiagram
     end
 ```
 
-当前命令只在启动时刷新；修改配置或下游工具后需重启。发现失败可以留下其他健康系统的可用目录，但不会放宽授权。详细边界见 [架构与威胁模型](docs/architecture.md)。
+默认命令在启动时刷新；显式客户端绑定成功后还会定向刷新该身份的对应系统，日常工具调用不会自动重新发现。配置/工具变化没有后台自动刷新机制；持久拓扑变更也不能简单靠改文件后重启，需受支持的迁移流程。发现失败可以留下其他健康系统的可用目录，但不会放宽授权。详细边界见 [架构与威胁模型](docs/architecture.md)。
 
 ## 已实现
 
@@ -93,7 +93,9 @@ sequenceDiagram
 - 分页、重复名称、恶意名称、异常 schema、下游不可用及目录大小都有边界处理。
 - 单个用户的某个系统发现失败时，该系统目录整体不发布；其他健康系统仍可使用。刷新失败不会保留旧目录。
 
-- 可选 [本人绑定页面](docs/account-preview.md)：有限期入口认证、本人绑定替换/撤销、定向刷新与过期拒绝，不授予工具权限。
+- 可选 [管理控制台](docs/admin-console.md)：独立管理员认证、真实服务/用户/工具/审计快照、CAS 授权与撤销操作。服务配置仅草稿校验，不冒充运行配置已应用；入口 token 生命周期仍走离线维护。
+- 可选 [客户端绑定通道](docs/client-binding.md)：用户只用网关 token 连接 MCP；获准服务缺凭据时，通过只读连接状态工具取得下一步说明，再用私有文件辅助 CLI 直接提交网关。当前仅合成本机通道，不要求另开绑定网页，不声称所有 AI 客户端已有原生安全输入支持。绑定不授予工具权限。
+- 历史 [本人绑定页面](docs/account-preview.md) 保留为默认关闭的兼容预览，不再作为推荐的用户使用流程。
 - 可选 [受控 HTTPS 与失败分类](docs/network-policy.md)：固定端点、IP 允许列表、TLS 验证和脱敏错误，不自动重试工具。
 
 ## 快速演示
@@ -115,6 +117,14 @@ demo 命令显式启动两个模拟下游 crm、docs，再执行真实发现。�
 
 ## 配置驱动入口
 
+首次接入请按[配置检查 → 启动 → 客户端验收 → 重启/升级](docs/onboarding.md)执行；该路径也说明可选私有凭据文件与常见错误。先做不联网、不读写数据库的引导配置检查：
+
+```sh
+go run ./cmd/gateway -operation check-config -config configs/demo.json
+```
+
+检查成功不代表下游可用或持久状态就绪。随后启动入口：
+
 ```sh
 go run ./cmd/gateway -config configs/demo.json -listen 127.0.0.1:8080
 ```
@@ -127,7 +137,7 @@ go run ./cmd/gateway -config configs/demo.json -listen 127.0.0.1:8080
 
 个人测试配置请复制为 `configs/dev.local.json`；除公开虚构示例 `configs/demo.json` 外，configs 下 JSON 配置默认忽略。不要在示例中填入真实凭证；gitignore 不是凭证保护或保险库。
 
-没有通配授权。配置中允许但下游未公布的工具不会出现，也不能调用。默认命令在启动时刷新目录；开启 -account 后，本人替换绑定会定向刷新该用户该系统。配置不可热改，没有公共管理 API 或后台刷新任务。
+没有通配授权。配置中允许但下游未公布的业务工具不会出现，也不能调用。默认命令在启动时刷新目录；显式启用客户端绑定后，连接状态控制工具可在缺少服务凭据时列出本人获准服务，成功绑定会定向刷新该用户该系统。服务拓扑仍不可热改；本地管理接口默认关闭，草稿校验不等于应用。没有后台周期刷新任务。
 
 ## 检查
 
@@ -136,9 +146,13 @@ go test -count=1 ./...
 go test -race -count=1 ./...
 go vet ./...
 go build ./...
+node --check internal/gateway/admin_assets/admin.js
+node tests/admin-console/frontend.test.cjs
 ```
 
 CI 使用 go.mod 的 Go 版本执行格式、模块验证、测试、race、vet 和构建。实现和验证边界见 [架构与威胁模型](docs/architecture.md)、[工具契约与传输兼容性](docs/compatibility.md) 与 [验证记录](docs/acceptance.md)。
+
+管理台前端使用 Node 内置模块做合成 DOM 回归，CI 会执行；这不等于浏览器视觉验收。超时预算和脱敏取证见[超时诊断](docs/timeout-diagnostics.md)。[Schema 执行隔离](docs/schema-isolation-design.md)仍是独立可行性原型，尚未接入网关。
 
 ## 原型限制与计划
 
@@ -146,7 +160,7 @@ CI 使用 go.mod 的 Go 版本执行格式、模块验证、测试、race、vet 
 
 固定明文 token 只是演示身份，不是可信生产认证。入口默认仅允许回环 HTTP；远程合成测试必须显式开启并满足入口凭据要求，明文另需危险许可开关。/mcp 拒绝浏览器 Origin，显式开启的 /account 只接受固定同源访问。下游可按允许列表启用 HTTPS，或显式允许仅供合成测试的 HTTP。拒绝重定向、外部/动态 schema 引用及递归引用，不适用于部署公网服务。工具描述、注解与返回内容仍是不可信外部数据；不提供提示注入净化保证。
 
-尚未完成：OAuth/OIDC、真实账号网页绑定、生产凭证库与安全备份恢复、管理界面、真实系统集成、多副本撤权、完整入口负载治理、生产密钥管理及完整审计覆盖。不代理 resources、prompts、sampling、任务扩展或任意远程 MCP 地址。已支持[有界的同文档 schema 引用](docs/schema-references.md)，后续持续完善兼容性回归，并单独设计真实认证和生产凭证生命周期；当前不启用真实写操作。
+尚未完成：OAuth/OIDC、真实账号网页绑定、生产凭证库与安全备份恢复、在线用户/服务拓扑管理、真实系统集成、多副本撤权、完整入口负载治理、生产密钥管理及完整审计覆盖。不代理 resources、prompts、sampling、任务扩展或任意远程 MCP 地址。已支持[有界的同文档 schema 引用](docs/schema-references.md)，后续持续完善兼容性回归，并单独设计真实认证和生产凭证生命周期；当前不启用真实写操作。
 
 ## 协议依据
 

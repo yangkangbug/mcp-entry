@@ -63,6 +63,8 @@ func normalizeLimits(v LimitsConfig) (LimitsConfig, error) {
 	return v, nil
 }
 
+// admissionBucket 的可变字段由所属 limiter 的单一互斥锁保护；桶自身不加锁。
+// 入口与出站各自持有独立桶，不能跨 limiter 共享可变桶。
 type admissionBucket struct {
 	limit  AdmissionLimit
 	active int
@@ -170,6 +172,7 @@ func (l *admissionLimiter) acquire(ctx context.Context, id Identity, system stri
 	if subject := l.subjects[system]; subject != "" {
 		buckets[3] = l.shared[subject]
 	}
+	// 检查顺序也决定多个桶同时耗尽时报告的首个拒绝范围。
 	scopes := [5]string{"principal", "tenant", "system", "shared_quota", "global"}
 	now := l.now()
 	for i, b := range buckets {
@@ -190,6 +193,7 @@ func (l *admissionLimiter) acquire(ctx context.Context, id Identity, system stri
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// 所有桶通过检查后才统一扣费，且仍在同一把锁内；中途拒绝不部分占槽。
 	for _, b := range buckets {
 		if b != nil {
 			b.active++

@@ -89,7 +89,7 @@ func TestFailurePhasesIgnoreLateEvidence(t *testing.T) {
 
 // Real loopback TLS + SDK tests ensure HTTP evidence survives SDK error wrapping.
 func TestFailureSDKConnectHTTPStatus(t *testing.T) {
-	for _, status := range []int{401, 403, 429, 503} {
+	for _, status := range []int{401, 403, 408, 429, 503, 504} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			requests := map[string]int{}
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +137,7 @@ func failureTestConnect(ctx context.Context, endpoint string, client *http.Clien
 
 func TestFailureSDKCallJSONAndSSE(t *testing.T) {
 	for _, format := range []string{"json", "sse"} {
-		for _, status := range []int{200, 401, 403, 429, 503} {
+		for _, status := range []int{200, 401, 403, 408, 429, 503, 504} {
 			t.Run(fmt.Sprintf("%s/%d", format, status), func(t *testing.T) {
 				calls := 0
 				server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

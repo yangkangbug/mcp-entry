@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // FailureCode describes evidence, not credential state or retry safety.
@@ -212,34 +213,60 @@ func (t failureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	t.observation.mu.Unlock()
 	response, err := t.base.RoundTrip(r)
 	if err != nil {
-		code := typedFailure(err)
-		if code == "" {
-			code = FailureTransport
-		}
+		code := requestFailure(r.Context(), r.Cancel, err)
 		t.observation.record(epoch, failureEvidence{code: code})
 	} else if response != nil {
 		t.observation.record(epoch, failureEvidence{code: statusFailure(response.StatusCode), status: response.StatusCode})
 		if response.Body != nil {
-			response.Body = &failureBody{ReadCloser: response.Body, observation: t.observation, epoch: epoch}
+			response.Body = &failureBody{ReadCloser: response.Body, observation: t.observation, epoch: epoch, requestContext: r.Context(), requestCancel: r.Cancel}
 		}
 	}
 	return response, err
 }
 
+// requestFailure observes the request's budget before net/http's outer client
+// wrapper adds timeout identity. For wrapped transports, the legacy Cancel
+// timer can fire before the context deadline callback, so also inspect the
+// declared deadline. An explicit context cancellation remains cancellation.
+func requestFailure(ctx context.Context, requestCancel <-chan struct{}, err error) FailureCode {
+	if ctx != nil {
+		if ctx.Err() != nil {
+			return typedFailure(ctx.Err())
+		}
+		// Only use elapsed deadline evidence when net/http's legacy cancellation
+		// has actually fired; elapsed time alone cannot reclassify an error.
+		select {
+		case <-requestCancel:
+			if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+				return FailureTimeout
+			}
+		default:
+		}
+	}
+	if code := typedFailure(err); code != "" {
+		return code
+	}
+	return FailureTransport
+}
+
 type failureBody struct {
 	io.ReadCloser
-	observation *failureObservation
-	epoch       uint64
+	observation    *failureObservation
+	epoch          uint64
+	requestContext context.Context
+	requestCancel  <-chan struct{}
 }
 
 func (b *failureBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
-	if err != nil && err != io.EOF {
-		code := typedFailure(err)
-		if code == "" {
-			code = FailureTransport
+	if err != nil {
+		code := requestFailure(b.requestContext, b.requestCancel, err)
+		// A canceled HTTP stream can race a server's graceful body close and
+		// surface EOF rather than a typed read error. Preserve proven budget
+		// evidence, while ordinary successful EOF remains unclassified.
+		if err != io.EOF || code == FailureTimeout || code == FailureCanceled {
+			b.observation.record(b.epoch, failureEvidence{code: code})
 		}
-		b.observation.record(b.epoch, failureEvidence{code: code})
 	}
 	return n, err
 }

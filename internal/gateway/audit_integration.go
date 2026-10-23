@@ -13,6 +13,9 @@ import (
 type AuditConfig struct {
 	Capacity int `json:"capacity,omitempty"`
 }
+
+// AuditStatus 区分运行中预留终态槽的 Pending 与缺少终态记录的 Unfinished。
+// 后者包含历史崩溃遗留及已归档的未知结果，不等于当前并发操作数。
 type AuditStatus struct {
 	ArchivedUnfinished uint64 `json:"archived_unfinished"`
 	Persistent         bool   `json:"persistent"`
@@ -25,6 +28,8 @@ type AuditStatus struct {
 	Capacity           int    `json:"capacity"`
 }
 
+// AuditStatus 读取可信进程内状态快照；Healthy 仅表示未标记审计故障，
+// 不表示下游健康，也不证明历史业务操作均已成功。
 func (g *Gateway) AuditStatus() AuditStatus {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -71,10 +76,16 @@ func (g *Gateway) auditEventLocked(id, system, tool string, p *principalState, a
 	}
 	return e
 }
+
+// auditRoomLocked 要求持有 g.mu；持久容量同时计入已有日志和已预留的终态槽。
+// 内存模式允许日志环淘汰，因而不在这里拒绝新增事件。
 func (g *Gateway) auditRoomLocked(extra uint64) bool {
 	return g.store == nil || g.store.auditSequence-g.store.auditBaseSequence+g.auditPending+extra <= uint64(g.auditCapacity)
 }
 func (g *Gateway) auditFailureLocked() { g.auditFault = true; g.closeLocked() }
+
+// appendAuditLocked 有存储时先提交事件和认证链头，再更新内存观察视图。
+// 任一步失败均封闭网关，避免在审计状态不确定时继续接纳业务操作。
 func (g *Gateway) appendAuditLocked(e AuditEvent) error {
 	if g.auditFault {
 		return ErrStorage
@@ -103,6 +114,9 @@ func (g *Gateway) trackAuditLocked(e AuditEvent) {
 		delete(g.auditUnfinished, e.RequestID)
 	}
 }
+
+// startAuditLocked 在操作开始前一次检查开始/终态两条记录的容量；
+// 成功写入开始事件后保留一个终态槽，结束时再释放该预留。
 func (g *Gateway) startAuditLocked(id, system, tool string, action AuditAction) (AuditEvent, error) {
 	if !g.auditRoomLocked(2) {
 		return AuditEvent{}, ErrAuditFull
@@ -152,6 +166,9 @@ func auditOutcome(err error) AuditResult {
 	}
 	return AuditResultUnknown
 }
+
+// finishOperation 在下游清理返回后结算终态。defer 的顺序保证先解开 g.mu，
+// 再释放准入并发槽，最后通知 Close 的等待者；取消信号本身不提前归还容量。
 func (g *Gateway) finishOperation(opID uint64, e AuditEvent, started time.Time, operationErr error, toolIsError bool, permit *admissionPermit) {
 	defer g.operationWG.Done()
 	defer permit.Release()
@@ -180,6 +197,9 @@ func (g *Gateway) auditContext() (context.Context, context.CancelFunc) {
 	}
 	return context.WithTimeout(parent, time.Second)
 }
+
+// writeAudit 只在调用方事务内追加一条记录，不修改 store 的内存链头。
+// 调用方须在同一事务更新认证清单，并在提交成功后发布新序号与链头。
 func (s *sqliteStore) writeAudit(ctx context.Context, tx *sql.Tx, e AuditEvent) (uint64, string, error) {
 	sequence := s.auditSequence + 1
 	e.Sequence = sequence
@@ -228,6 +248,9 @@ func (s *sqliteStore) updateAuditManifest(ctx context.Context, tx *sql.Tx, recor
 	}
 	return nil
 }
+
+// loadAudit 从归档锚点恢复保留的日志，检查连续序号、每条 MAC 和最终链头。
+// 整体状态 MAC 仍由外层 load 校验；重建未完成集合不重试任何历史业务操作。
 func (s *sqliteStore) loadAudit(ctx context.Context, g *Gateway) error {
 	if s.version >= 4 {
 		if err := s.conn.QueryRowContext(ctx, "SELECT audit_base_sequence,audit_base_head,audit_archive_hash FROM meta WHERE id=1").Scan(&s.auditBaseSequence, &s.auditBaseHead, &s.auditArchiveHash); err != nil {

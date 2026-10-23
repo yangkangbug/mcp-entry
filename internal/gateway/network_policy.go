@@ -43,6 +43,8 @@ func compileNetworkPolicy(endpoint string, policy *NetworkPolicy) (http.RoundTri
 
 var errNetworkPolicy = errors.New("downstream network policy denied")
 
+// parseNetworkEndpoint 只接受无歧义的固定端点表示；凭据、查询参数及路径转义
+// 不作为配置入口的一部分，后续请求必须与这里解析的完整 URL 相同。
 func parseNetworkEndpoint(endpoint string) (*url.URL, error) {
 	if len(endpoint) == 0 || len(endpoint) > 2048 {
 		return nil, errNetworkPolicy
@@ -178,6 +180,8 @@ func compileNetworkPolicyWith(endpoint string, policy *NetworkPolicy, deps netwo
 		}
 	}
 	address := net.JoinHostPort(u.Hostname(), port)
+	// 实际拨号使用 IP，但 TLS 仍校验配置的主机名；不读取环境代理配置。
+	// 禁用连接复用，使新请求重新经过下面的解析和地址准入检查。
 	transport := &http.Transport{
 		Proxy: nil, DisableKeepAlives: true, ForceAttemptHTTP2: false,
 		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: u.Hostname()},
@@ -213,6 +217,7 @@ func compileNetworkPolicyWith(endpoint string, policy *NetworkPolicy, deps netwo
 		if len(ips) == 0 || len(ips) > 64 {
 			return nil, errNetworkPolicy
 		}
+		// 整组 DNS 答复必须获准；不能从混有禁止地址的答复中挑一个可用地址。
 		for _, ip := range ips {
 			if !permittedNetworkIP(ip) || !allowed[ip.Unmap()] {
 				return nil, errNetworkPolicy
@@ -230,10 +235,13 @@ type endpointTransport struct {
 	base     *http.Transport
 }
 
+// RoundTrip 在发送前固定 URL 与 Host，避免上层请求把凭据带往别的端点。
+// 拒绝重定向发生在传输层，调用方不能借助 http.Client 的默认跳转扩大访问范围。
 func (t *endpointTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.URL == nil || r.URL.String() != t.endpoint.String() || (r.Host != "" && r.Host != t.endpoint.Host) {
 		return nil, errNetworkPolicy
 	}
+	// 克隆后再删环境性认证头，避免修改调用方共享的请求；下游认证头仍保留。
 	copy := r.Clone(r.Context())
 	for name := range copy.Header {
 		if strings.EqualFold(name, "Cookie") || strings.EqualFold(name, "Proxy-Authorization") {

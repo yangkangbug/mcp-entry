@@ -26,6 +26,8 @@ type Config struct {
 	Users   map[string]User `json:"users"`
 }
 
+// System 定义管理员配置的固定下游及认证方式；请求参数不能覆盖路由。
+// 非空 QuotaSubject 相同的系统共享出站配额桶，不改变各用户的凭据与工具权限。
 type System struct {
 	QuotaSubject string         `json:"quota_subject,omitempty"`
 	Name         string         `json:"name"`
@@ -102,6 +104,9 @@ func validCredential(value string, auth AuthConfig) bool {
 	return auth.Mode != "bearer" || bearerCredentialPattern.MatchString(value)
 }
 
+// User 是初始化身份的配置输入：Token 用于入口认证，Credentials 按系统保存
+// 下游凭据，两者不可互换；Allowed 是完整公开工具名的显式白名单。
+// 重开持久库时，已有授权和凭据以经过认证的存储状态为准，不重新导入这些种子值。
 type User struct {
 	TokenExpiresAt time.Time         `json:"token_expires_at,omitempty"`
 	Tenant         string            `json:"tenant,omitempty"`
@@ -112,6 +117,7 @@ type User struct {
 }
 
 // LoadConfig rejects unknown fields, trailing documents and oversized configuration.
+// 此处只解码配置；系统拓扑、身份唯一性及网络策略等语义校验由构造网关时执行。
 func LoadConfig(r io.Reader) (Config, error) {
 	var cfg Config
 	data, err := io.ReadAll(io.LimitReader(r, (256<<10)+1))

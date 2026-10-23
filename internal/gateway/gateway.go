@@ -1,4 +1,5 @@
-// Package gateway implements a demo-only, stateless MCP tool gateway.
+// Package gateway 实现合成测试用 MCP 工具网关：隔离身份、授权目录与下游凭据。
+// MCP 传输使用无状态会话；授权状态可选 SQLite 持久化，不等于整个网关无状态。
 package gateway
 
 import (
@@ -34,11 +35,18 @@ type entry struct {
 	generation    uint64
 	policyVersion uint64
 }
+
+// snapshot 发布后只读；目录与对应 SDK handler 必须成对替换，读者可持有旧快照，
+// 但实际列举/调用仍须重新核对当前授权和绑定代次。
 type snapshot struct {
 	catalogs map[string]map[string]entry
 	handlers map[string]http.Handler
 }
+
+// Gateway 由固定拓扑、可变身份状态和只读目录快照组成。mu 串行化授权变更、
+// 最终准入及审计发布；网络 I/O 在锁外执行，完成后再检查版本是否仍可发布。
 type Gateway struct {
+	clientBindingEnabled    atomic.Bool
 	ingress                 *ingressLimiter
 	rejections              rejectionSummary
 	auditArchivedUnfinished uint64
@@ -76,7 +84,8 @@ type DiscoveryIssue struct {
 	Failure *DownstreamFailure `json:"failure,omitempty"`
 }
 
-// New copies configuration. Nothing is published until Refresh discovers authorized tools.
+// New 复制并校验配置，不执行下游发现；业务目录在 Refresh 后才可能有工具。
+// 显式启用的本地连接状态工具不属于下游业务目录。
 func New(cfg Config) (*Gateway, error) { return newGateway(cfg, true) }
 func newGateway(cfg Config, bootstrap bool) (*Gateway, error) {
 	if len(cfg.Systems) > 16 || len(cfg.Users) > 64 {
@@ -179,6 +188,8 @@ func newGateway(cfg Config, bootstrap bool) (*Gateway, error) {
 	return g, nil
 }
 
+// Names 返回当前仍满足授权和绑定状态的业务工具名，按名称排序。
+// id 是内部配置用户键，不是外部认证凭据；此方法不列出本地连接状态工具。
 func (g *Gateway) Names(id string) []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -524,6 +535,7 @@ func validateSchemaTypes(value any) error {
 
 // Call authorizes independently of discovery and validates the discovered input schema.
 // Neither caller arguments nor downstream names can choose an endpoint or credential.
+// id 由可信调用方提供；HTTP 路径须先验证入口 token，不能直接采信请求中的用户键。
 func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *mcp.CallToolResult, retErr error) {
 	g.mu.Lock()
 	e, exists := g.evaluateLocked(id, name)
@@ -554,6 +566,8 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// schema 校验可能耗时，先在锁外完成；下方最终准入会重新确认同一目录版本，
+	// 防止校验期间发生的撤权或刷新被这次调用越过。
 	if err := e.input.Validate(input); err != nil {
 		g.rejectOperation(ctx, RejectionOperationArguments)
 		return nil, errors.New("arguments do not match discovered schema")
@@ -618,8 +632,11 @@ func (g *Gateway) makeSnapshot(catalogs map[string]map[string]entry) *snapshot {
 	return state
 }
 
+// toolHandler 将身份绑定在服务端闭包中。业务工具走 Call 的独立准入，
+// 本地连接状态工具只读获准服务元数据，不沿业务下游转发路径执行。
 func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler {
 	server := mcp.NewServer(&mcp.Implementation{Name: "mcp-entry", Version: "0.2.0-demo"}, nil)
+	g.addClientBindingTool(server, id)
 	for name, e := range catalog {
 		server.AddTool(e.tool, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			result, err := g.Call(ctx, id, name, req.Params.Arguments)
@@ -650,6 +667,10 @@ func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler 
 			defer g.mu.Unlock()
 			filtered := make([]*mcp.Tool, 0, len(list.Tools))
 			for _, tool := range list.Tools {
+				if tool.Name == clientConnectionsTool && g.clientBindingEnabled.Load() && g.principalUsableLocked(id) {
+					filtered = append(filtered, tool)
+					continue
+				}
 				e, exists := catalog[tool.Name]
 				current, allowed := g.evaluateLocked(id, tool.Name)
 				if exists && allowed && current.tool == e.tool && g.entryAllowedLocked(id, tool.Name, e) {
@@ -665,6 +686,7 @@ func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler 
 }
 
 // Handler reauthenticates every request, never using session IDs as identities.
+// 返回值已包装入口限额；宿主仍负责监听地址、TLS、原始头和连接读取预算。
 func (g *Gateway) Handler() http.Handler {
 	return g.GuardHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Origin") != "" {

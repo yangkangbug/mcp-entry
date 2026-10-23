@@ -27,7 +27,9 @@ func (t *toolFlags) String() string         { return "" }
 func (t *toolFlags) Set(value string) error { *t = append(*t, value); return nil }
 
 type options struct {
-	archiveFile                                                       string
+	archiveFile, credentialsFile                                      string
+	adminTokenFile                                                    string
+	clientBinding                                                     bool
 	entryFile, entryExpiry, newKeyFile                                string
 	allowRemoteTest, allowInsecureHTTPTest                            bool
 	tlsCert, tlsKey                                                   string
@@ -41,6 +43,8 @@ type options struct {
 
 var errOptions = errors.New("invalid command options; use -help for supported combinations")
 
+// parseOptions 按操作建立参数组合边界；seen 区分未指定与显式传入零值，
+// 防止无关选项被静默忽略，让维护命令意外带入服务启动配置。
 func parseOptions(args []string, help io.Writer) (options, error) {
 	var o options
 	fs := flag.NewFlagSet("gateway", flag.ContinueOnError)
@@ -49,14 +53,17 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 	fs.BoolVar(&o.allowInsecureHTTPTest, "allow-insecure-http-test", false, "serve only: explicitly permit plaintext remote testing; credentials are not encrypted")
 	fs.StringVar(&o.tlsCert, "tls-cert", "", "serve only: PEM server certificate file")
 	fs.StringVar(&o.tlsKey, "tls-key", "", "serve only: private PEM server key file")
+	fs.StringVar(&o.credentialsFile, "credentials-file", "", "bootstrap only: private JSON file supplementing configured user credentials; no overrides")
 	fs.StringVar(&o.config, "config", "configs/demo.json", "synthetic local configuration file")
 	fs.StringVar(&o.listen, "listen", "127.0.0.1:8080", "serve only: literal IP listen address; loopback unless remote test explicitly enabled")
 	fs.StringVar(&o.db, "db", "", "optional local SQLite path; existing file required unless -init-db")
 	fs.StringVar(&o.keyFile, "key-file", "", "private regular file containing exactly 32 raw synthetic key bytes")
 	fs.BoolVar(&o.keyStdin, "key-stdin", false, "read exactly 32 raw synthetic key bytes followed by EOF from stdin")
+	fs.BoolVar(&o.clientBinding, "client-binding", false, "serve only: enable loopback client credential binding without a webpage; strong finite entry credentials required")
+	fs.StringVar(&o.adminTokenFile, "admin-token-file", "", "serve only: opt-in loopback admin console with separate private 43-byte synthetic authority")
 	fs.BoolVar(&o.account, "account", false, "serve only: enable local own-binding page; requires strong finite entry credentials")
 	fs.BoolVar(&o.initialize, "init-db", false, "serve only: explicitly initialize a nonexistent database")
-	fs.StringVar(&o.operation, "operation", "serve", "serve, status, audit, audit-all, archive-audit, migrate, rotate-key, replace-entry, revoke-entry, revoke-binding, disable-principal, or set-policy")
+	fs.StringVar(&o.operation, "operation", "serve", "serve, check-config, status, audit, audit-all, archive-audit, migrate, rotate-key, replace-entry, revoke-entry, revoke-binding, disable-principal, or set-policy")
 	fs.StringVar(&o.tenant, "tenant", "", "offline only: configured synthetic tenant")
 	fs.StringVar(&o.principal, "principal", "", "offline only: configured synthetic principal")
 	fs.StringVar(&o.system, "system", "", "revoke-binding requires system; status optionally filters system")
@@ -81,6 +88,17 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 	}
 	seen := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { seen[f.Name] = true })
+	if seen["credentials-file"] && (o.credentialsFile == "" || (o.operation != "check-config" && (o.operation != "serve" || (o.db != "" && !o.initialize)))) {
+		return o, errOptions
+	}
+	if o.operation == "check-config" {
+		for name := range seen {
+			if name != "operation" && name != "config" && name != "credentials-file" {
+				return o, errOptions
+			}
+		}
+		return o, nil
+	}
 	if seen["db"] && o.db == "" || seen["key-file"] && o.keyFile == "" || seen["key-stdin"] && !o.keyStdin {
 		return o, errOptions
 	}
@@ -104,6 +122,9 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 		return o, errOptions
 	}
 	if o.operation == "serve" {
+		if seen["admin-token-file"] && o.adminTokenFile == "" {
+			return o, errOptions
+		}
 		for _, name := range []string{"tenant", "principal", "system", "expected-version", "allow"} {
 			if seen[name] {
 				return o, errOptions
@@ -126,12 +147,12 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 		if o.allowRemoteTest && o.tlsCert == "" && !o.allowInsecureHTTPTest {
 			return o, errOptions
 		}
-		if o.account && (o.allowRemoteTest || o.tlsCert != "") {
+		if (o.account || o.clientBinding || o.adminTokenFile != "") && (o.allowRemoteTest || o.tlsCert != "") {
 			return o, errOptions
 		}
 		return o, nil
 	}
-	if seen["allow-remote-test"] || seen["allow-insecure-http-test"] || seen["tls-cert"] || seen["tls-key"] || seen["listen"] || seen["init-db"] || seen["account"] || o.db == "" {
+	if seen["client-binding"] || seen["admin-token-file"] || seen["allow-remote-test"] || seen["allow-insecure-http-test"] || seen["tls-cert"] || seen["tls-key"] || seen["listen"] || seen["init-db"] || seen["account"] || o.db == "" {
 		return o, errOptions
 	}
 	globalOperation := o.operation == "migrate" || o.operation == "rotate-key" || o.operation == "audit-all" || o.operation == "archive-audit"
@@ -187,6 +208,8 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 	return o, nil
 }
 
+// readKey 读取原始 32 字节而非文本编码；文件路径须为私有普通文件，
+// 打开后核对同一文件，避免只检查路径却读取被替换的对象。
 func readKey(o options, stdin io.Reader) ([]byte, error) {
 	if o.db == "" {
 		return nil, nil
@@ -307,6 +330,7 @@ func operate(g *gateway.Gateway, cfg gateway.Config, o options, output io.Writer
 	if err != nil {
 		return err
 	}
+	// 操作可能已持久提交，输出失败不等于变更失败；调用方须检查状态而非重放。
 	if err = json.NewEncoder(output).Encode(result); err != nil {
 		return errors.New("cannot write operation result; inspect persisted status before retrying")
 	}
@@ -344,13 +368,27 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if (o.account || o.allowRemoteTest) && (o.db == "" || o.initialize) {
+	if o.credentialsFile != "" {
+		cfg, err = loadCredentials(cfg, o.credentialsFile)
+		if err != nil {
+			return err
+		}
+	}
+	// 配置预检在读取存储密钥、打开数据库和监听网络之前返回。
+	if o.operation == "check-config" {
+		return checkConfig(cfg, stdout)
+	}
+	// 初始化前先检查自助/远程入口凭据要求，避免无效认证配置先创建数据库。
+	// 重开既有库则必须在恢复存储权威状态后检查，不能采信配置种子。
+	if (o.account || o.clientBinding || o.allowRemoteTest) && (o.db == "" || o.initialize) {
 		preview, err := gateway.New(cfg)
 		if err != nil {
 			return err
 		}
 		if o.allowRemoteTest {
 			err = preview.ValidateTestEntryAuth()
+		} else if o.clientBinding {
+			_, err = preview.ClientBindingHandler("http://127.0.0.1:1")
 		} else {
 			_, err = preview.AccountHandler("http://127.0.0.1:1")
 		}
@@ -391,6 +429,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 			return err
 		}
 	}
+	var adminToken string
+	if o.adminTokenFile != "" {
+		adminToken, err = readEntryFile(o.adminTokenFile)
+		if err != nil {
+			return errors.New("cannot read private admin authority file")
+		}
+		if _, err = g.AdminHandler("http://127.0.0.1:1", adminToken); err != nil {
+			return err
+		}
+	}
 	// Invalid persistence must not open a socket. Explicit initialization may
 	// already have committed if binding fails; retry by reopening, never delete.
 	listener, err := net.Listen("tcp", o.listen)
@@ -421,6 +469,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		mux.Handle("/account", account)
 		mux.Handle("/account/", account)
 	}
+	if o.clientBinding {
+		binding, err := g.ClientBindingHandler("http://" + listener.Addr().String())
+		if err != nil {
+			return err
+		}
+		mux.Handle("/binding/", binding)
+	}
+	if o.adminTokenFile != "" {
+		admin, err := g.AdminHandler("http://"+listener.Addr().String(), adminToken)
+		if err != nil {
+			return err
+		}
+		mux.Handle("/admin", admin)
+		mux.Handle("/admin/", admin)
+	}
+	// 在整个 mux 外包一层入口防护，未知路由和管理路由也受同一总预算约束；
+	// 已自行包装 GuardHTTP 的路由通过上下文标记避免重复计费。
 	server := newGatewayHTTPServer(g.GuardHTTP(mux), tlsConfig)
 	done := make(chan error, 1)
 	go func() {
@@ -447,6 +512,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		}
 	}
 	logger.Printf("NONPRODUCTION SYNTHETIC GATEWAY: %s://%s/mcp; %d discovery issue(s); no downstreams started", scheme, listener.Addr(), len(issues))
+	if o.adminTokenFile != "" {
+		logger.Printf("LOCAL ADMIN CONSOLE: http://%s/admin; separate operator authority required", listener.Addr())
+	}
+	if o.clientBinding {
+		logger.Print("LOCAL CLIENT BINDING enabled; use private-file client flow, never MCP tool arguments for credentials")
+	}
 	select {
 	case err := <-done:
 		if !errors.Is(err, http.ErrServerClosed) {
@@ -512,6 +583,8 @@ func readServerTLS(certPath, keyPath string) (*tls.Config, error) {
 	return &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{pair}}, nil
 }
 
+// readEntryFile 只验证私有文件及精确字节长度，不剥除换行；token 的规范编码
+// 和用途分离由 ReplaceEntry/AdminHandler 等消费方验证，不能仅凭读取成功授权。
 func readEntryFile(path string) (string, error) {
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() != 43 {
