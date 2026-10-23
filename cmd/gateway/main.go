@@ -1,10 +1,12 @@
 // Command gateway runs a synthetic gateway or a trusted offline operator.
-// Remote test ingress requires explicit opt-in and never enables account pages.
+// Remote test ingress requires explicit opt-in; legacy account/admin remain loopback.
+// Remote browser binding requires a fixed public origin and direct TLS.
 package main
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -30,6 +33,7 @@ type options struct {
 	archiveFile, credentialsFile                                      string
 	adminTokenFile                                                    string
 	clientBinding                                                     bool
+	bindingPublicOrigin                                               string
 	entryFile, entryExpiry, newKeyFile                                string
 	allowRemoteTest, allowInsecureHTTPTest                            bool
 	tlsCert, tlsKey                                                   string
@@ -59,7 +63,8 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 	fs.StringVar(&o.db, "db", "", "optional local SQLite path; existing file required unless -init-db")
 	fs.StringVar(&o.keyFile, "key-file", "", "private regular file containing exactly 32 raw synthetic key bytes")
 	fs.BoolVar(&o.keyStdin, "key-stdin", false, "read exactly 32 raw synthetic key bytes followed by EOF from stdin")
-	fs.BoolVar(&o.clientBinding, "client-binding", false, "serve only: enable loopback client credential binding without a webpage; strong finite entry credentials required")
+	fs.StringVar(&o.bindingPublicOrigin, "binding-public-origin", "", "serve only: canonical HTTPS binding origin; requires client-binding, allow-remote-test and direct TLS; no proxy TLS termination")
+	fs.BoolVar(&o.clientBinding, "client-binding", false, "serve only: enable client binding (loopback by default); remote browser flow requires binding-public-origin and direct TLS")
 	fs.StringVar(&o.adminTokenFile, "admin-token-file", "", "serve only: opt-in loopback admin console with separate private 43-byte synthetic authority")
 	fs.BoolVar(&o.account, "account", false, "serve only: enable local own-binding page; requires strong finite entry credentials")
 	fs.BoolVar(&o.initialize, "init-db", false, "serve only: explicitly initialize a nonexistent database")
@@ -147,12 +152,18 @@ func parseOptions(args []string, help io.Writer) (options, error) {
 		if o.allowRemoteTest && o.tlsCert == "" && !o.allowInsecureHTTPTest {
 			return o, errOptions
 		}
-		if (o.account || o.clientBinding || o.adminTokenFile != "") && (o.allowRemoteTest || o.tlsCert != "") {
+		// HTTPS 绑定必须显式启用整组开关，连显式 false 的明文/账户选项也拒绝，避免静默忽略。
+		if seen["binding-public-origin"] {
+			if gateway.ValidateHTTPSBindingOrigin(o.bindingPublicOrigin) != nil || !o.clientBinding || !o.allowRemoteTest || o.tlsCert == "" || seen["allow-insecure-http-test"] || seen["account"] || seen["admin-token-file"] {
+				return o, errOptions
+			}
+		}
+		if (o.account || o.clientBinding && o.bindingPublicOrigin == "" || o.adminTokenFile != "") && (o.allowRemoteTest || o.tlsCert != "") {
 			return o, errOptions
 		}
 		return o, nil
 	}
-	if seen["client-binding"] || seen["admin-token-file"] || seen["allow-remote-test"] || seen["allow-insecure-http-test"] || seen["tls-cert"] || seen["tls-key"] || seen["listen"] || seen["init-db"] || seen["account"] || o.db == "" {
+	if seen["binding-public-origin"] || seen["client-binding"] || seen["admin-token-file"] || seen["allow-remote-test"] || seen["allow-insecure-http-test"] || seen["tls-cert"] || seen["tls-key"] || seen["listen"] || seen["init-db"] || seen["account"] || o.db == "" {
 		return o, errOptions
 	}
 	globalOperation := o.operation == "migrate" || o.operation == "rotate-key" || o.operation == "audit-all" || o.operation == "archive-audit"
@@ -401,6 +412,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// SAN 与有效期检查不代表公共 CA 信任；客户端仍须独立验证证书链。
+	if o.bindingPublicOrigin != "" {
+		if err := validateBindingTLS(tlsConfig, o.bindingPublicOrigin, time.Now()); err != nil {
+			return err
+		}
+	}
 	key, err := readKey(o, stdin)
 	if err != nil {
 		return err
@@ -470,7 +487,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		mux.Handle("/account/", account)
 	}
 	if o.clientBinding {
-		binding, err := g.ClientBindingHandler("http://" + listener.Addr().String())
+		var binding http.Handler
+		var err error
+		if o.bindingPublicOrigin != "" {
+			// 入口只使用操作员配置，不从 Host/Forwarded 或监听地址推断公共域名。
+			binding, err = g.HTTPSClientBindingHandler(o.bindingPublicOrigin)
+		} else {
+			binding, err = g.ClientBindingHandler("http://" + listener.Addr().String())
+		}
 		if err != nil {
 			return err
 		}
@@ -516,7 +540,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		logger.Printf("LOCAL ADMIN CONSOLE: http://%s/admin; separate operator authority required", listener.Addr())
 	}
 	if o.clientBinding {
-		logger.Print("LOCAL CLIENT BINDING enabled; use private-file client flow, never MCP tool arguments for credentials")
+		if o.bindingPublicOrigin != "" {
+			logger.Print("HTTPS CLIENT BINDING enabled; direct TLS only; certificate SAN and validity preflight does not establish public CA trust; never send credentials in MCP tool arguments")
+		} else {
+			logger.Print("LOCAL CLIENT BINDING enabled; use private-file client flow, never MCP tool arguments for credentials")
+		}
 	}
 	select {
 	case err := <-done:
@@ -605,4 +633,24 @@ func readEntryFile(path string) (string, error) {
 	}
 	defer clear(data)
 	return string(data), nil
+}
+
+// validateBindingTLS 仅做无网络、无数据库副作用的部署前检查；不隐式信任自签名证书，
+// 也不把本机根证书库当成浏览器公共信任的证明。TLS 握手仍由客户端验证信任链。
+func validateBindingTLS(config *tls.Config, origin string, now time.Time) error {
+	invalid := errors.New("invalid HTTPS binding certificate: require matching SAN and current validity; public CA trust is not established by preflight")
+	if gateway.ValidateHTTPSBindingOrigin(origin) != nil || config == nil || len(config.Certificates) != 1 || len(config.Certificates[0].Certificate) == 0 {
+		return invalid
+	}
+	u, _ := url.Parse(origin)
+	for i, der := range config.Certificates[0].Certificate {
+		cert, err := x509.ParseCertificate(der)
+		if err != nil || now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
+			return invalid
+		}
+		if i == 0 && cert.VerifyHostname(u.Hostname()) != nil {
+			return invalid
+		}
+	}
+	return nil
 }

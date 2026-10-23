@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -18,7 +19,7 @@ import (
 
 // No '__': configured business tools always contain that separator.
 const clientConnectionsTool = "mcp_entry_connections"
-const bindingInstructions = "Use mcp_entry_connection_begin with service_id and expected_generation to show a short-lived browser link to the user, or the trusted local connect helper with private owner-only entry and provider credential files. A link is not proof of user identity: the browser independently authenticates the user. Never paste credentials into chat, tool arguments, elicitation forms, URLs or command-line values. Confirm the gateway address independently. If submission is interrupted, inspect generation before any new explicit attempt. Binding does not grant tools or repeat a business operation."
+const bindingInstructions = "Use mcp_entry_connection_begin with service_id and expected_generation to show a short-lived browser link to the user, or, only when the local loopback channel is enabled, the trusted local connect helper with private owner-only entry and provider credential files. A link is not proof of user identity: the browser independently authenticates the user. Never paste credentials into chat, tool arguments, elicitation forms, URLs or command-line values. Confirm the gateway address independently. If submission is interrupted, inspect generation before any new explicit attempt. Binding does not grant tools or repeat a business operation."
 
 type clientService struct {
 	System     string `json:"system"`
@@ -55,6 +56,10 @@ func (g *Gateway) clientServicesContext(ctx context.Context, id string) (clientS
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	out := clientServices{Services: []clientService{}, Submission: "one_time_browser_link_or_private_file_cli", Instructions: bindingInstructions}
+	if strings.HasPrefix(g.clientBindingOrigin, "https://") {
+		out.Submission = "one_time_browser_link"
+		out.Instructions = "Use mcp_entry_connection_begin with service_id and expected_generation to show a short-lived browser link to the user. This HTTPS channel only accepts browser sessions; direct CLI credential submission is disabled. A link is not proof of user identity: the browser independently authenticates the user. Never paste credentials into chat, tool arguments, elicitation forms, URLs or command-line values. Confirm the gateway address independently. If submission is interrupted, inspect generation before any new explicit attempt. Binding does not grant tools or repeat a business operation."
+	}
 	if !g.clientBindingEnabled.Load() || !g.principalUsableLocked(id) || !g.entryRevisionAllowedLocked(ctx, id) {
 		return out, ErrDenied
 	}
@@ -85,7 +90,7 @@ func (g *Gateway) addClientBindingTool(server *mcp.Server, id string) {
 		return
 	}
 	g.addConnectionSessionTools(server, id)
-	server.AddTool(&mcp.Tool{Name: clientConnectionsTool, Description: "Read current user's authorized configured service connection metadata and secure local submission instructions. Does not accept credentials, contact providers or change bindings.", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	server.AddTool(&mcp.Tool{Name: clientConnectionsTool, Description: "Read current user's authorized configured service connection metadata and secure connection instructions (private-file CLI only for the local loopback mode). Does not accept credentials, contact providers or change bindings.", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -156,22 +161,9 @@ func (g *Gateway) ClientBindingHandler(expectedOrigin string) (http.Handler, err
 	if err != nil || e != nil || n < 1 || n > 65535 || (host != "127.0.0.1" && host != "::1") || u.String() != expectedOrigin {
 		return nil, errors.New("invalid binding origin")
 	}
-	if err := g.validateAccountAuth(); err != nil {
+	if err := g.enableClientBinding(expectedOrigin); err != nil {
 		return nil, err
 	}
-	g.mu.Lock()
-	if g.clientBindingOrigin != "" && g.clientBindingOrigin != expectedOrigin {
-		g.mu.Unlock()
-		return nil, errors.New("binding origin already fixed")
-	}
-	g.clientBindingOrigin = expectedOrigin
-	if g.connectionSessions == nil {
-		g.connectionSessions = map[string]*connectionSession{}
-	}
-	// 同时更新开关和 handler 快照，使已发现业务目录保留并获得本地控制工具。
-	g.clientBindingEnabled.Store(true)
-	g.state.Store(g.makeSnapshot(g.state.Load().catalogs))
-	g.mu.Unlock()
 	guarded := g.GuardHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if g.serveConnectionBrowser(w, r, u.Host, expectedOrigin) {
 			return
@@ -307,4 +299,130 @@ func clientBindingFailure(w http.ResponseWriter, err error) {
 		return
 	}
 	accountFailure(w, err)
+}
+
+// enableClientBinding 固定整个网关唯一的 origin；scheme 也是身份边界的一部分，
+// 因此重复构造不能从 HTTPS 降级为旧的 loopback HTTP 通道。
+func (g *Gateway) enableClientBinding(expectedOrigin string) error {
+	if err := g.validateAccountAuth(); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	if g.clientBindingOrigin != "" && g.clientBindingOrigin != expectedOrigin {
+		g.mu.Unlock()
+		return errors.New("binding origin already fixed")
+	}
+	g.clientBindingOrigin = expectedOrigin
+	if g.connectionSessions == nil {
+		g.connectionSessions = map[string]*connectionSession{}
+	}
+	// 同时更新开关和 handler 快照，使已发现业务目录保留并获得本地控制工具。
+	g.clientBindingEnabled.Store(true)
+	g.state.Store(g.makeSnapshot(g.state.Load().catalogs))
+	g.mu.Unlock()
+	return nil
+}
+
+// HTTPSClientBindingHandler explicitly enables the direct-TLS browser-only channel.
+// The host must attach it to a TLS listener; TLS-terminating reverse proxies and
+// plaintext fallback are deliberately unsupported. Configuration is not MCP input.
+func (g *Gateway) HTTPSClientBindingHandler(expectedOrigin string) (http.Handler, error) {
+	host, err := canonicalBindingHTTPSOrigin(expectedOrigin)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.enableClientBinding(expectedOrigin); err != nil {
+		return nil, err
+	}
+	guarded := g.GuardHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 必须是本连接真实 TLS；URL scheme 和代理头都不能证明传输安全。
+		denied := !directHTTPSBindingRequest(r, host) || len(r.Header.Values("Origin")) > 1 ||
+			(len(r.Header.Values("Origin")) == 1 && r.Header.Get("Origin") != expectedOrigin)
+		if denied {
+			accountError(w, http.StatusForbidden, "request_denied")
+			return
+		}
+		if !g.serveConnectionBrowser(w, r, host, expectedOrigin) {
+			// 远程只开放一次性 browser session，不顺带开放旧 CLI 直接替换/撤销路径。
+			accountError(w, http.StatusNotFound, "not_found")
+		}
+	}))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accountHeaders(w)
+		guarded.ServeHTTP(w, r)
+	}), nil
+}
+
+// canonicalBindingHTTPSOrigin 不做隐式修复或DNS解析；配置必须已经是浏览器
+// 序列化的规范 origin（443省略、非默认端口十进制、DNS小写、IP无zone）。
+func canonicalBindingHTTPSOrigin(origin string) (string, error) {
+	invalid := errors.New("invalid binding HTTPS origin")
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Host == "" || u.Path != "" ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return "", invalid
+	}
+	hostname := u.Hostname()
+	host := hostname
+	if ip, err := netip.ParseAddr(hostname); err == nil {
+		if ip.Zone() != "" || ip.String() != hostname || ip.IsUnspecified() || ip.IsMulticast() || ip.Is4In6() {
+			return "", invalid
+		}
+		if ip.Is6() {
+			host = "[" + hostname + "]"
+		}
+	} else {
+		if len(hostname) == 0 || len(hostname) > 253 || hostname != strings.ToLower(hostname) {
+			return "", invalid
+		}
+		labels := strings.Split(hostname, ".")
+		// 数字结尾的非IP主机在浏览器中可能被解释为旧式IPv4，不作为DNS接收。
+		last := labels[len(labels)-1]
+		if last == "" || (last[0] >= '0' && last[0] <= '9') {
+			return "", invalid
+		}
+		for _, label := range labels {
+			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+				return "", invalid
+			}
+			for _, ch := range label {
+				if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-') {
+					return "", invalid
+				}
+			}
+		}
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 || n == 443 || strconv.Itoa(n) != port {
+			return "", invalid
+		}
+		host += ":" + port
+	}
+	if origin != "https://"+host {
+		return "", invalid
+	}
+	return host, nil
+}
+
+// ValidateHTTPSBindingOrigin validates direct-TLS binding configuration without
+// enabling the binding channel or changing gateway state.
+func ValidateHTTPSBindingOrigin(origin string) error {
+	_, err := canonicalBindingHTTPSOrigin(origin)
+	return err
+}
+
+// directHTTPSBindingRequest 绑定浏览器与 MCP transport 共用传输边界，
+// 不能以代理提供的信息冒充本连接的 TLS 或改变固定 Host。
+func directHTTPSBindingRequest(r *http.Request, host string) bool {
+	if r.TLS == nil || r.Host != host {
+		return false
+	}
+	for name := range r.Header {
+		name = strings.ToLower(name)
+		if name == "forwarded" || strings.HasPrefix(name, "x-forwarded-") {
+			return false
+		}
+	}
+	return true
 }

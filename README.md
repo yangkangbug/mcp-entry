@@ -94,7 +94,7 @@ sequenceDiagram
 - 单个用户的某个系统发现失败时，该系统目录整体不发布；其他健康系统仍可使用。刷新失败不会保留旧目录。
 
 - 可选 [管理控制台](docs/admin-console.md)：独立管理员认证、真实服务/用户/工具/审计快照、CAS 授权与撤销操作。持久模式支持[用户创建与入口凭据生命周期](docs/managed-user-lifecycle.md)，以及[服务新增和超时配置的受控应用](docs/runtime-service-config.md)。需要预览、一次确认和版本校验；生效不代表连通或自动授权。
-- 可选 [客户端绑定通道](docs/client-binding.md)：用户用网关 token 连接 MCP；获准服务缺凭据时获得结构化下一步提示，可通过统一 MCP 工具发起[短期一次授权链接](docs/one-time-binding.md)，由用户在页面独立验证身份并直接提交服务凭据，Agent 只读取状态。私有文件辅助 CLI 继续保留。当前仅合成本机通道，不绑定客户端品牌，不声称远程授权、OAuth 或所有客户端原生安全输入已验证。绑定不授予工具权限，也不重放业务调用。
+- 可选 [客户端绑定通道](docs/client-binding.md)：用户用网关 token 连接 MCP；获准服务缺凭据时获得结构化下一步提示，可通过统一 MCP 工具发起[短期一次授权链接](docs/one-time-binding.md)，由用户在页面独立验证身份并直接提交服务凭据，Agent 只读取状态。私有文件辅助 CLI 继续保留且仅限 HTTP 字面量回环。页面支持本机合成测试，或显式组合 `--client-binding --allow-remote-test --binding-public-origin --tls-cert --tls-key` 的固定 HTTPS origin / 网关直接 TLS 合成测试；不支持代理 TLS 终止或 Host/Forwarded 推导 origin。远程模式不暴露旧直接 CLI 绑定端点，不声称生产就绪、OAuth、浏览器视觉 QA 或所有客户端原生安全输入已验证。绑定不授予工具权限，也不重放业务调用。
 - 历史 [本人绑定页面](docs/account-preview.md) 保留为默认关闭的兼容预览，不再作为推荐的用户使用流程。
 - 可选 [受控 HTTPS 与失败分类](docs/network-policy.md)：固定端点、IP 允许列表、TLS 验证和脱敏错误，不自动重试工具。
 

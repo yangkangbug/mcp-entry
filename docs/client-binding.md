@@ -1,18 +1,20 @@
-# Client-driven binding: bounded local vertical
+# Client-driven binding: bounded synthetic vertical
 
-Implemented opt-in **synthetic loopback** flow with two private submission options:
-a [one-time browser connection page](one-time-binding.md) or the existing CLI helper:
+Implemented opt-in **synthetic testing** flow with a
+[one-time browser connection page](one-time-binding.md) on literal-loopback HTTP
+or explicitly configured direct TLS. The existing private-file CLI helper remains
+**HTTP literal-loopback only**:
 
 1. Start the gateway with `--client-binding` (existing serve options still apply).
-   Strong canonical finite entry credentials are required. Remote/TLS listener modes
-   are deliberately not enabled for this test surface.
+   Strong canonical finite entry credentials are required. Remote browser testing
+   requires all the direct-TLS flags and trust prerequisites below.
 2. The MCP catalogue includes `mcp_entry_connections`, even when no business tool
    can be discovered. It takes only `{}` and returns this identity's configured
    services with at least one currently authorized policy tool. It cannot change
    bindings, choose an identity/endpoint, receive credentials, or contact providers.
 3. The agent may request a short-lived link with `mcp_entry_connection_begin`,
    show it to the user, and read its sanitized status with
-   `mcp_entry_connection_status`. The user independently verifies the local gateway
+   `mcp_entry_connection_status`. The user independently verifies the gateway
    address, authenticates in the page with their own current MCP entry token (not
    an admin token), reviews the verified target, then enters the provider token and
    explicitly confirms. The link alone is not proof of user identity. Alternatively,
@@ -21,6 +23,52 @@ a [one-time browser connection page](one-time-binding.md) or the existing CLI he
 4. The dedicated API derives identity from the gateway bearer, checks current entry
    generation, policy, binding generation, and commits via the existing atomic
    persistence/audit path. It then attempts scoped discovery, never a business call.
+
+## Listener modes and trust boundaries
+
+The default remains `--client-binding` on an HTTP literal-loopback listener.
+Remote browser sessions require **all** of `--client-binding`,
+`--allow-remote-test`, `--binding-public-origin`, `--tls-cert` and `--tls-key`.
+`--binding-public-origin` is a fixed HTTPS origin (scheme + host + optional port),
+not a page URL: do not include userinfo, a path, query or fragment. Use a concrete
+reachable DNS name or IP, not a wildcard bind address. This is the external origin
+users actually visit; `--listen` is the process-local bind address. Layer-4 TLS
+passthrough or port mapping can make their ports differ, provided the external
+origin routes to this gateway's TLS listener without terminating TLS elsewhere.
+The public origin's host must match the certificate SAN (DNS SAN for a name, IP
+SAN for an IP). The program does not verify network routing or reachability.
+Provision the origin and certificate trust independently of the agent link.
+
+Illustrative **synthetic-only** configuration (paths and metadata, no secrets):
+
+```sh
+go run ./cmd/gateway --config /private/synthetic-config.json \
+  --listen 0.0.0.0:8443 --client-binding --allow-remote-test \
+  --binding-public-origin https://gateway.test:8443 \
+  --tls-cert /private/gateway-test.crt --tls-key /private/gateway-test.key
+```
+
+This example assumes `gateway.test` is deliberately resolved to the test gateway,
+the certificate contains `DNS:gateway.test` in its SAN, and its issuing test CA is
+trusted by the test browser/client. Supply strong, canonical, finite synthetic
+entry credentials in the configuration; this is not a way to expose demo tokens.
+Keep the test private and restrict network access. Do not use real accounts or
+production secrets, disable TLS verification, or click through certificate warnings.
+Certificate loading/name checks do not establish browser trust or endpoint ownership.
+
+The gateway itself terminates TLS. Reverse-proxy TLS termination is **not supported**;
+`Host`, `Forwarded` and `X-Forwarded-*` never provision or select the public origin.
+Browser requests must match the configured origin/authority and arrive over direct
+TLS. `--allow-insecure-http-test` does not enable remote client binding. Existing
+admin/account restrictions remain unchanged; this does not publish those surfaces.
+
+`HTTPSClientBindingHandler` exposes only the page/assets and browser session APIs
+(`inspect`, `confirm`, `cancel`). It does **not** expose the old direct CLI routes
+`/binding/api/services` or `/binding/api/credentials`. The local HTTP handler keeps
+those routes; `cmd/connect` is not extended to remote HTTPS. MCP control tools remain
+metadata-only and generate links using the fixed configured origin, never a request
+header. Remote delivery changes neither authorization scope nor receipt lifetime,
+and does not run or replay the user's original business operation.
 
 ## Existing CLI helper
 
@@ -87,7 +135,7 @@ These are metadata-only control tools, not business tools:
   characters) and an integer generation of at least 1. It returns
   `{session_locator,service_id,expires_at,authorization_url,state:"pending",instructions}`.
   The URL is `/binding/#<session_locator>.<capability>` at the configured trusted
-  loopback origin. Both components are random canonical 43-character base64url
+  literal-loopback origin, or the explicitly configured HTTPS public origin. Both components are random canonical 43-character base64url
   values. Begin creates a session, not a provider binding or business request.
 - `mcp_entry_connection_status({"session_locator":"<43-character locator>"})`
   accepts only that locator, not the capability or credentials. It is restricted
@@ -141,10 +189,11 @@ resubmit automatically or replay the original business operation. See the
 [page lifecycle and unknown-outcome rules](one-time-binding.md) for browser cleanup,
 explicit cancellation and verification coverage.
 
-Both HTTP helper target and API listener are pinned to explicit literal loopback
-origins. The helper disables proxying, redirects and replay. HTTPS remote delivery
-requires a separately reviewed extension with verified TLS and trusted target
-provisioning; never bypass TLS validation to extend this local test mode.
+The HTTP helper target and legacy direct CLI API remain pinned to explicit literal
+loopback origins. The helper disables proxying, redirects and replay. Only the
+one-time browser session surface supports the opt-in direct-TLS mode described
+above; this is a bounded synthetic extension, not production readiness, OAuth, or
+verified native support across MCP clients.
 
 The older `/account` page is unchanged and is not required by this flow. Binding
 never changes tool policy, reenables a principal, restores a revoked entry token,

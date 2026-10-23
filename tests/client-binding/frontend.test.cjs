@@ -11,7 +11,7 @@ class Element {
   addEventListener(name, fn) { this.handlers[name] = fn; }
   fire(name) { return this.handlers[name]?.({preventDefault() {}}); }
 }
-function setup({hash = '#' + 'a'.repeat(43) + '.' + 'b'.repeat(43), search = '', historyFails = false} = {}) {
+function setup({hash = '#' + 'a'.repeat(43) + '.' + 'b'.repeat(43), search = '', historyFails = false, origin = 'http://127.0.0.1:8080'} = {}) {
   const elements = {};
   for (const m of html.matchAll(/<\w+[^>]*\bid="([^"]+)"[^>]*>/g)) {
     const el = elements[m[1]] = new Element(); el.disabled = m[0].includes('disabled'); el.hidden = m[0].includes('hidden');
@@ -19,7 +19,7 @@ function setup({hash = '#' + 'a'.repeat(43) + '.' + 'b'.repeat(43), search = '',
   const translated = [...html.matchAll(/data-i18n="([^"]+)"[^>]*>([^<]*)</g)].map(m => Object.assign(new Element(), {dataset: {i18n: m[1]}, textContent: m[2]}));
   const document = {getElementById: id => elements[id], querySelectorAll: () => translated, documentElement: {}};
   const calls = [], pending = [], history = [];
-  const window = {location: {hash, search, pathname: '/binding/', origin: 'http://127.0.0.1:8080'}, handlers: {}, addEventListener(name, fn) { this.handlers[name] = fn; }};
+  const window = {location: {hash, search, pathname: '/binding/', origin, protocol: new URL(origin).protocol, hostname: new URL(origin).hostname}, handlers: {}, addEventListener(name, fn) { this.handlers[name] = fn; }};
   window.history = {replaceState(...args) { if (historyFails) throw Error('blocked'); history.push(args); window.location.hash = ''; window.location.search = ''; }};
   vm.runInNewContext(src, {document, window, AbortController, fetch(url, opts) { calls.push({url, opts}); return new Promise((resolve, reject) => pending.push({resolve, reject})); }});
   return {e: elements, calls, pending, window, history};
@@ -63,6 +63,30 @@ function save(h) { h.e.credential.value = 'provider-secret'; h.e.confirm.checked
   assert.equal(h.e.details.hidden, true); assert.equal(h.e.identity.textContent, '');
   h.e.language.value = 'en'; h.e.language.fire('change'); assert.match(h.e.message.textContent, /Credential saved/);
   h.e['binding-form'].fire('submit'); assert.equal(h.calls.length, 2);
+
+  // Transport admission is fail-closed before either form can send a secret.
+  for (const origin of ['http://127.0.0.2:8080', 'http://127.2.3.4:8080', 'http://gateway.example:8443', 'http://localhost:8080', 'http://127.0.0.1.example:8080', 'http://192.0.2.1', 'http://[::ffff:7f00:1]', 'file:///binding/']) {
+    h = setup({origin});
+    assert.equal(h.window.location.hash, '', 'strip capability even on unsafe transport');
+    assert.equal(h.e.entry.disabled, true);
+    assert.match(h.e.message.textContent, /不安全的页面地址/);
+    verify(h); save(h); assert.equal(h.calls.length, 0);
+    h.e.language.value = 'en'; h.e.language.fire('change');
+    assert.match(h.e.message.textContent, /Unsafe page address/);
+  }
+  for (const origin of ['https://gateway.example:8443', 'https://192.0.2.1:8443', 'http://127.0.0.1:8080', 'http://[::1]:8080']) {
+    h = setup({origin});
+    assert.equal(h.calls.length, 0, 'HTTPS and loopback never auto-submit');
+    assert.equal(h.window.location.hash, '');
+    await verified(h);
+    assert.equal(h.e.gateway.textContent, origin);
+    assert.equal(h.calls[0].url, '/binding/api/session/inspect');
+    save(h);
+    assert.equal(h.calls[1].url, '/binding/api/session/confirm');
+    await respond(h, {binding_saved: true, discovery_status: 'ready'});
+    assert.match(h.e.message.textContent, /凭据已保存/);
+    assert.equal(h.calls.length, 2);
+  }
 
   for (const options of [{hash: ''}, {hash: '#bad'}, {search: '?secret=bad'}, {historyFails: true}]) {
     h = setup(options); verify(h); save(h); assert.equal(h.calls.length, 0, 'invalid URL fails closed'); assert.equal(h.e.entry.disabled, true);

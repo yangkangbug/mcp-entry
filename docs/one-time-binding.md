@@ -1,9 +1,11 @@
-# One-time connection page (synthetic loopback only)
+# One-time connection page (synthetic testing only)
 
 The opt-in `--client-binding` surface adds a user-facing page at `/binding/`.
-It does **not** replace `/account`, enable remote delivery, implement OAuth, or
-make this nonproduction gateway safe for real credentials. Use synthetic tokens
-and an independently verified literal-loopback gateway origin only.
+It does **not** replace `/account`, implement OAuth, or make this nonproduction
+gateway safe for real credentials. Use synthetic tokens only. The original HTTP
+mode is restricted to a literal-loopback gateway; the opt-in remote mode requires
+a fixed, independently trusted HTTPS origin with TLS terminated by this gateway.
+See [listener configuration and trust boundaries](client-binding.md#listener-modes-and-trust-boundaries).
 
 ## User / agent boundary
 
@@ -13,7 +15,11 @@ and an independently verified literal-loopback gateway origin only.
 2. The user independently verifies the browser address. The page immediately
    extracts `#<session_locator>.<capability>` into memory and removes the fragment
    with `history.replaceState`. Neither component is accepted through query fields.
-   The page does not automatically send requests on load.
+   The page does not automatically send requests on load. Its transport guard
+   refuses non-loopback HTTP (including `localhost` names) and non-HTTP(S) pages,
+   clears secrets and disables both forms. HTTPS admission is **not** proof that
+   a gateway is trustworthy: independently verify the exact origin and certificate
+   before entering even synthetic credentials; never bypass certificate warnings.
 3. A link is **not identity proof**. The user privately enters their own current
    MCP gateway token, not an administrator token. Explicit verification calls
    `POST /binding/api/session/inspect` with that Bearer and the locator/capability.
@@ -66,7 +72,8 @@ manager behavior is not a guarantee of secure memory erasure.
 
 Run `node --check internal/gateway/binding_assets/binding.js` and
 `node tests/client-binding/frontend.test.cjs`. CI includes both. The dependency-free
-Node DOM tests cover fragment stripping and fail-closed URLs, no load-time network,
+Node DOM tests cover fragment stripping and fail-closed URLs, rejection of remote
+HTTP and non-HTTP(S), HTTPS admission and IPv4/IPv6 loopback regressions, no load-time network,
 independent authentication before target display, explicit consent, duplicate-click
 suppression, request shape/privacy options, success versus discovery, clear/offline/
 pagehide, late JSON responses, invalid responses, unknown saves and explicit cancel.

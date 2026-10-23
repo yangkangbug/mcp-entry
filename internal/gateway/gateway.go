@@ -722,7 +722,23 @@ func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler 
 			return &copy, nil
 		}
 	})
-	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, MaxRequestBodyBytes: 64 << 10})
+	opts := &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, MaxRequestBodyBytes: 64 << 10}
+	// HTTPS固定origin模式用更严格的TLS+Host边界代替SDK按LocalAddr的默认
+	// localhost判断：公开DNS origin可能连接回环TLS监听器，但不能允许重绑定。
+	// origin由构造时捕获，旧snapshot独立持有防护，不能依赖main外层包装。
+	host, err := canonicalBindingHTTPSOrigin(g.clientBindingOrigin)
+	if err != nil {
+		return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, opts)
+	}
+	opts.DisableLocalhostProtection = true
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, opts)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !directHTTPSBindingRequest(r, host) || len(r.Header.Values("Origin")) != 0 {
+			http.Error(w, "request denied", http.StatusForbidden)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
 }
 
 // Handler reauthenticates every request, never using session IDs as identities.

@@ -19,6 +19,7 @@
     failed: '验证失败或返回异常。页面秘密已清除，请检查连接状态后生成新链接。',
     unknown: '保存结果未知：请求可能已完成。页面秘密已清除，不会重试。请让 Agent 查询连接状态；不要直接再次提交，也不要自动重放原业务请求。',
     cleared: '页面秘密已清除。此页面不能继续；服务器链接不一定已撤销。需要时请生成新链接。',
+    unsafeOrigin: '不安全的页面地址。HTTP 仅允许字面量回环地址；远程测试必须使用你独立信任且证书有效的 HTTPS 网关。不要绕过证书警告。页面秘密已清除。',
     consentNeeded: '请先核对目标、填写服务凭据，并勾选明确确认。'
   });
   const en = {
@@ -27,8 +28,8 @@
     savedUnavailable: 'Credential saved, but tool discovery is unavailable. Check status, provider credentials and permissions. Discovery failure is not save failure; do not blindly repeat the save. No business operation ran.',
     savedIncomplete: 'Credential saved, but discovery did not complete. Check connection status; do not blindly repeat the save. No business operation ran.',
     title: 'One-time connection · MCP Entry', heading: 'Authorize one connection',
-    intro: 'Local synthetic testing only. This page accepts provider credentials; it is not automatic third-party OAuth authorization and executes no business operation.',
-    trust: 'Independently verify that the browser address is your trusted local gateway first. The link does not prove your identity. Never paste credentials into chat or ask an AI agent to fill them in.',
+    intro: 'Synthetic testing only. This page accepts provider credentials; it is not automatic third-party OAuth authorization and executes no business operation.',
+    trust: 'Independently verify the gateway address first: HTTP is allowed only on a literal loopback address; remote testing requires your trusted HTTPS gateway and a valid certificate. Do not bypass certificate warnings. The link does not prove your identity. Never paste credentials into chat or ask an AI agent to fill them in.',
     step1: '1. Independently verify your identity', entryHelp: 'Enter your own current MCP gateway token, not an administrator token. The service and identity appear only after verification.',
     entryLabel: 'Your MCP gateway token', verify: 'Verify identity and target', step2: '2. Review target and explicitly confirm',
     gateway: 'Gateway', identity: 'Your identity (tenant / principal)', service: 'Service', auth: 'Credential type', expiry: 'Link expires at',
@@ -44,6 +45,7 @@
     failed: 'Verification failed or response invalid. Page secrets cleared. Check connection status and request a new link.',
     unknown: 'Save outcome unknown: the request may have completed. Page secrets cleared; no retry will occur. Ask the agent to check connection status. Do not resubmit blindly or automatically replay the original business request.',
     cleared: 'Page secrets cleared. This page cannot continue; the server link may not be revoked. Request a new link if needed.',
+    unsafeOrigin: 'Unsafe page address. HTTP requires a literal loopback address; remote testing requires an independently trusted HTTPS gateway with a valid certificate. Do not bypass certificate warnings. Page secrets cleared.',
     consentNeeded: 'Review the target, enter a provider credential, and check explicit confirmation.'
   };
   let messageKey = 'ready';
@@ -90,6 +92,14 @@
   $('close').addEventListener('click', endPage);
   window.addEventListener('pagehide', endPage);
   window.addEventListener('offline', endPage);
+  // This is a transport guard, not proof of gateway trust. HTTPS trust and the
+  // fixed public origin must be provisioned independently; never infer them from
+  // the fragment. Clear the fragment even on a disallowed origin before stopping.
+  const host = window.location.hostname;
+  const literalLoopback = host === '[::1]' || host === '127.0.0.1';
+  const safeTransport = window.location.protocol === 'https:' ||
+    (window.location.protocol === 'http:' && literalLoopback);
+  if (!safeTransport) { clear('unsafeOrigin'); return; }
   if (!validLink || hadQuery) { clear('invalid'); return; }
   renderMessage('ready');
 
