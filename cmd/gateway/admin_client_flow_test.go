@@ -150,7 +150,7 @@ func TestAdminClientExecutableBindingLifecycle(t *testing.T) {
 	}
 	process := start(true)
 	session := cliE2EConnect(t, address, entry)
-	cliE2ETools(t, session, "mcp_entry_connections")
+	cliE2ETools(t, session, "mcp_entry_connections", "mcp_entry_connection_begin", "mcp_entry_connection_status")
 	cliE2ECall(t, session, "crm__echo", "alice", false)
 	// The SDK closes its transport after an unknown-tool protocol rejection.
 	// Use a fresh authenticated session for the independent control flow.
@@ -186,7 +186,7 @@ func TestAdminClientExecutableBindingLifecycle(t *testing.T) {
 		t.Fatalf("binding/discovery not completed: %s", bound)
 	}
 	status("active", 2)
-	cliE2ETools(t, session, "crm__echo", "mcp_entry_connections")
+	cliE2ETools(t, session, "crm__echo", "mcp_entry_connections", "mcp_entry_connection_begin", "mcp_entry_connection_status")
 	cliE2ECall(t, session, "crm__echo", "alice", true)
 	preview := `{"action":"revoke_binding","tenant":"demo","principal":"alice","system":"crm","expected_version":2,"preview":true}`
 	adminCall("POST", "/admin/api/mutate", admin, preview, 200)
@@ -196,14 +196,14 @@ func TestAdminClientExecutableBindingLifecycle(t *testing.T) {
 	adminCall("POST", "/admin/api/mutate", admin, confirmed, 200)
 	adminCall("POST", "/admin/api/mutate", admin, confirmed, 409)
 	status("revoked", 3)
-	cliE2ETools(t, session, "mcp_entry_connections")
+	cliE2ETools(t, session, "mcp_entry_connections", "mcp_entry_connection_begin", "mcp_entry_connection_status")
 	cliE2ECall(t, session, "crm__echo", "alice", false)
 	_ = session.Close()
 	process.stop(t)
 	process = start(false)
 	session = cliE2EConnect(t, address, entry)
 	status("revoked", 3)
-	cliE2ETools(t, session, "mcp_entry_connections")
+	cliE2ETools(t, session, "mcp_entry_connections", "mcp_entry_connection_begin", "mcp_entry_connection_status")
 	cliE2ECall(t, session, "crm__echo", "alice", false)
 	audit := adminCall("POST", "/admin/api/audit", admin, `{"after":0,"limit":100}`, 200)
 	var page gateway.AuditPage

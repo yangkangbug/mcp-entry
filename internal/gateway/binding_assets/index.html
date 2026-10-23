@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>一次连接 · MCP Entry</title><link rel="stylesheet" href="/binding/binding.css"><script src="/binding/binding.js" defer></script></head>
+<body><main>
+<header><p class="eyebrow">MCP ENTRY · SYNTHETIC LOOPBACK</p><label for="language">语言 / Language</label><select id="language"><option value="zh-CN">中文</option><option value="en">English</option></select></header>
+<h1 data-i18n="heading">一次连接授权</h1>
+<p data-i18n="intro">仅限本地合成测试。此页面录入服务凭据，不是第三方 OAuth 自动授权，也不执行任何业务操作。</p>
+<p class="notice" data-i18n="trust">请先独立核对浏览器地址确为你信任的本地网关。链接本身不能证明你的身份。不要在聊天中粘贴任何凭据，也不要让 AI Agent 代填。</p>
+<section><h2 data-i18n="step1">1. 独立验证本人身份</h2><p data-i18n="entryHelp">输入你本人当前的 MCP 网关 token（不是管理员 token）。验证成功后才会显示本次连接的服务和身份。</p>
+<form id="identity-form" autocomplete="off"><label for="entry" data-i18n="entryLabel">本人 MCP 网关 token</label><input id="entry" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" maxlength="4096" required><button id="verify" type="submit" data-i18n="verify">验证身份与连接目标</button></form></section>
+<section id="details" hidden><h2 data-i18n="step2">2. 核对目标并明确确认</h2><dl><dt data-i18n="gateway">网关</dt><dd id="gateway"></dd><dt data-i18n="identity">本人身份（租户 / 用户）</dt><dd id="identity"></dd><dt data-i18n="service">服务</dt><dd id="service"></dd><dt data-i18n="auth">凭据类型</dt><dd id="auth"></dd><dt data-i18n="expiry">链接到期时间</dt><dd id="expiry"></dd></dl>
+<p data-i18n="providerHelp">请自行从该服务获取合成测试凭据。页面不会返回已有凭据；保存可能替换本人该服务的已有绑定，但不会扩大工具权限。</p>
+<form id="binding-form" autocomplete="off"><label for="credential" data-i18n="credentialLabel">新的服务凭据</label><input id="credential" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" maxlength="4096" required disabled><label class="check"><input id="confirm" type="checkbox" required disabled><span data-i18n="consent">我已核对网关、本人身份和服务，同意保存此凭据。</span></label><button id="save" type="submit" data-i18n="save" disabled>确认并保存一次</button></form><button id="cancel" type="button" data-i18n="cancel" disabled>取消此链接</button></section>
+<button id="close" type="button" data-i18n="close">清除并结束此页面</button>
+<p id="message" role="status" aria-live="polite"></p><p class="fine" data-i18n="privacy">秘密仅留在当前页面内存和密码输入框；离开页面或离线会清除。页面不保存秘密到浏览器存储，不自动重试或重放业务请求。清除页面不等于撤销服务器链接；链接仍可能有效直到到期。</p>
+<noscript>此页面需要 JavaScript 才能安全处理一次链接。请勿在此输入凭据。</noscript>
+</main></body></html>

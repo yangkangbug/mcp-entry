@@ -47,6 +47,8 @@ type snapshot struct {
 // 最终准入及审计发布；网络 I/O 在锁外执行，完成后再检查版本是否仍可发布。
 type Gateway struct {
 	clientBindingEnabled    atomic.Bool
+	clientBindingOrigin     string
+	connectionSessions      map[string]*connectionSession
 	ingress                 *ingressLimiter
 	rejections              rejectionSummary
 	auditArchivedUnfinished uint64
@@ -680,6 +682,13 @@ func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler 
 			}
 			ctx = withEntryRevision(ctx, p.identity, generation)
 			ctx = context.WithValue(ctx, operationRejectionKey{}, &operationRejection{})
+			if method == "tools/call" {
+				if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok {
+					if required := g.connectionRequired(ctx, id, params.Name); required != nil {
+						return required, nil
+					}
+				}
+			}
 			result, err := next(ctx, method, req)
 			if err != nil {
 				g.rejectOperation(ctx, RejectionOperationProtocol)
@@ -698,7 +707,7 @@ func (g *Gateway) toolHandler(id string, catalog map[string]entry) http.Handler 
 			}
 			filtered := make([]*mcp.Tool, 0, len(list.Tools))
 			for _, tool := range list.Tools {
-				if tool.Name == clientConnectionsTool && g.clientBindingEnabled.Load() && g.principalUsableLocked(id) {
+				if isConnectionControlTool(tool.Name) && g.clientBindingEnabled.Load() && g.principalUsableLocked(id) {
 					filtered = append(filtered, tool)
 					continue
 				}

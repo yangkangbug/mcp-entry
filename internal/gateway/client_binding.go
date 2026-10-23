@@ -18,7 +18,7 @@ import (
 
 // No '__': configured business tools always contain that separator.
 const clientConnectionsTool = "mcp_entry_connections"
-const bindingInstructions = "Use the trusted local connect helper with private owner-only entry and provider credential files. Never paste credentials into chat, tool arguments, elicitation forms, URLs or command-line values. Confirm the gateway address independently. If submission is interrupted, inspect generation before any new explicit attempt. Binding does not grant tools or repeat a business operation."
+const bindingInstructions = "Use mcp_entry_connection_begin with service_id and expected_generation to show a short-lived browser link to the user, or the trusted local connect helper with private owner-only entry and provider credential files. A link is not proof of user identity: the browser independently authenticates the user. Never paste credentials into chat, tool arguments, elicitation forms, URLs or command-line values. Confirm the gateway address independently. If submission is interrupted, inspect generation before any new explicit attempt. Binding does not grant tools or repeat a business operation."
 
 type clientService struct {
 	System     string `json:"system"`
@@ -54,7 +54,7 @@ func (g *Gateway) clientServicesFor(id string) (clientServices, error) {
 func (g *Gateway) clientServicesContext(ctx context.Context, id string) (clientServices, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	out := clientServices{Services: []clientService{}, Submission: "private_file_cli", Instructions: bindingInstructions}
+	out := clientServices{Services: []clientService{}, Submission: "one_time_browser_link_or_private_file_cli", Instructions: bindingInstructions}
 	if !g.clientBindingEnabled.Load() || !g.principalUsableLocked(id) || !g.entryRevisionAllowedLocked(ctx, id) {
 		return out, ErrDenied
 	}
@@ -84,6 +84,7 @@ func (g *Gateway) addClientBindingTool(server *mcp.Server, id string) {
 	if !g.clientBindingEnabled.Load() {
 		return
 	}
+	g.addConnectionSessionTools(server, id)
 	server.AddTool(&mcp.Tool{Name: clientConnectionsTool, Description: "Read current user's authorized configured service connection metadata and secure local submission instructions. Does not accept credentials, contact providers or change bindings.", InputSchema: map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -108,6 +109,10 @@ func (g *Gateway) addClientBindingTool(server *mcp.Server, id string) {
 func (g *Gateway) replaceClientBinding(identity Identity, system string, expected uint64, entryGeneration uint64, credential string, expiry time.Time) (BindingInfo, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.replaceClientBindingLocked(identity, system, expected, entryGeneration, credential, expiry)
+}
+
+func (g *Gateway) replaceClientBindingLocked(identity Identity, system string, expected, entryGeneration uint64, credential string, expiry time.Time) (BindingInfo, error) {
 	id, p, err := g.principalLocked(identity)
 	if err != nil {
 		return BindingInfo{}, err
@@ -137,7 +142,7 @@ func (g *Gateway) replaceClientBinding(identity Identity, system string, expecte
 	return b.info, nil
 }
 
-// ClientBindingHandler is an opt-in non-browser synthetic loopback channel. The
+// ClientBindingHandler is an opt-in synthetic loopback browser and CLI channel. The
 // fixed listener origin is deployment configuration, never supplied by MCP data.
 // 成功构造会启用本地只读连接工具并重建 handler；提交凭据走独立 HTTP 路径，
 // 不是 MCP 工具参数。宿主必须将返回的 handler 挂到对应的回环监听器。
@@ -155,12 +160,22 @@ func (g *Gateway) ClientBindingHandler(expectedOrigin string) (http.Handler, err
 		return nil, err
 	}
 	g.mu.Lock()
+	if g.clientBindingOrigin != "" && g.clientBindingOrigin != expectedOrigin {
+		g.mu.Unlock()
+		return nil, errors.New("binding origin already fixed")
+	}
+	g.clientBindingOrigin = expectedOrigin
+	if g.connectionSessions == nil {
+		g.connectionSessions = map[string]*connectionSession{}
+	}
 	// 同时更新开关和 handler 快照，使已发现业务目录保留并获得本地控制工具。
 	g.clientBindingEnabled.Store(true)
 	g.state.Store(g.makeSnapshot(g.state.Load().catalogs))
 	g.mu.Unlock()
-	return g.GuardHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		accountHeaders(w)
+	guarded := g.GuardHTTP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if g.serveConnectionBrowser(w, r, u.Host, expectedOrigin) {
+			return
+		}
 		if r.Host != u.Host || r.URL.RawQuery != "" || r.URL.ForceQuery || strings.Contains(r.URL.EscapedPath(), "%") || len(r.Header.Values("Authorization")) != 1 || len(r.Header.Values("Origin")) != 0 || len(r.Header.Values("Cookie")) != 0 || len(r.Header.Values("Sec-Fetch-Site")) != 0 {
 			accountError(w, 403, "request_denied")
 			return
@@ -264,7 +279,8 @@ func (g *Gateway) ClientBindingHandler(expectedOrigin string) (http.Handler, err
 		default:
 			accountError(w, 404, "not_found")
 		}
-	})), nil
+	}))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { accountHeaders(w); guarded.ServeHTTP(w, r) }), nil
 }
 
 // authenticateClientEntry 将入口认证和代次捕获放在同一锁内；解析请求后写入时

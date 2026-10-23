@@ -342,8 +342,24 @@ func TestServiceTimeoutConfiguredOperationAndCleanup(t *testing.T) {
 						t.Fatalf("call evidence: %v", err)
 					}
 				}
-				if (parent.Err() != nil) != (stage == "parent") {
-					t.Fatal("wrong deadline layer")
+				if stage == "parent" {
+					// The transport copies the absolute operation deadline onto the
+					// SDK's detached request context. Its timer may fire before the
+					// parent's timer callback becomes visible; Err is not a clock.
+					deadline, ok := parent.Deadline()
+					if !ok || time.Now().Before(deadline) {
+						t.Fatal("call timed out before the parent deadline")
+					}
+					select {
+					case <-parent.Done():
+					case <-time.After(time.Second):
+						t.Fatal("parent deadline cancellation did not become visible")
+					}
+					if !errors.Is(parent.Err(), context.DeadlineExceeded) {
+						t.Fatalf("wrong parent cancellation: %v", parent.Err())
+					}
+				} else if parent.Err() != nil {
+					t.Fatal("operation budget incorrectly exhausted the parent")
 				}
 				if calls.Load() != 1 {
 					t.Fatal("unexpected dispatch count")
@@ -353,6 +369,55 @@ func TestServiceTimeoutConfiguredOperationAndCleanup(t *testing.T) {
 			case <-entered:
 			default:
 				t.Fatal("expected stage not exercised")
+			}
+		})
+	}
+}
+
+// Verify deadline selection directly rather than inferring the selected budget
+// from scheduler-sensitive wall-clock timing. The SDK can detach its requests
+// from the operation context, so the transport must restore the earlier parent
+// deadline without extending an even earlier request deadline.
+func TestServiceTimeoutParentDeadlinePropagatesToTransport(t *testing.T) {
+	parentDeadline := time.Now().Add(time.Minute)
+	parent, cancelParent := context.WithDeadline(context.Background(), parentDeadline)
+	defer cancelParent()
+	operation, cancelOperation := context.WithTimeout(parent, 2*time.Minute)
+	defer cancelOperation()
+	for _, stage := range []string{"detached", "later_request", "earlier_request"} {
+		t.Run(stage, func(t *testing.T) {
+			requestContext := context.Background()
+			want := parentDeadline
+			if stage != "detached" {
+				requestDeadline := parentDeadline.Add(time.Minute)
+				if stage == "earlier_request" {
+					requestDeadline = parentDeadline.Add(-30 * time.Second)
+					want = requestDeadline
+				}
+				var cancel context.CancelFunc
+				requestContext, cancel = context.WithDeadline(requestContext, requestDeadline)
+				defer cancel()
+			}
+			called := false
+			base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				called = true
+				got, ok := r.Context().Deadline()
+				if !ok || !got.Equal(want) {
+					t.Fatalf("transport deadline = %v (%v), want %v", got, ok, want)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("synthetic"))}, nil
+			})
+			request, err := http.NewRequestWithContext(requestContext, http.MethodGet, "http://127.0.0.1", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := (credentialTransport{base: base, token: "synthetic", operation: operation}).RoundTrip(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if !called {
+				t.Fatal("transport was not exercised")
 			}
 		})
 	}

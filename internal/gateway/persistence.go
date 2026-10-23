@@ -597,6 +597,11 @@ func (g *Gateway) publishPrincipalLocked(id string, p *principalState, system st
 }
 func (g *Gateway) closeLocked() error {
 	g.closed = true
+	for key, session := range g.connectionSessions {
+		session.timer.Stop()
+		session.capability = [32]byte{}
+		delete(g.connectionSessions, key)
+	}
 	for _, op := range g.operations {
 		op.cancel()
 	}

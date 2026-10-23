@@ -26,6 +26,10 @@ jobs:
           node --version
           node --check internal/gateway/admin_assets/admin.js
           node tests/admin-console/frontend.test.cjs
+      - name: Check one-time binding page state and syntax
+        run: |
+          node --check internal/gateway/binding_assets/binding.js
+          node tests/client-binding/frontend.test.cjs
       - name: Test
         run: go test -count=1 ./...
       - name: Test with race detector

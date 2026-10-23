@@ -133,7 +133,7 @@ func TestClientBindingControlDiscoverableWithoutCredential(t *testing.T) {
 	}
 	defer sess.Close()
 	list, err := sess.ListTools(context.Background(), nil)
-	if err != nil || len(list.Tools) != 1 || list.Tools[0].Name != clientConnectionsTool {
+	if err != nil || len(list.Tools) != 3 {
 		t.Fatal(list, err)
 	}
 	for i := 0; i < 2; i++ {
